@@ -1,4 +1,4 @@
-# Let's Go RSS 🛰️
+# Let's Go RSS 🛰️ 全平台 RSS 订阅管理器
 
 > **AI-Powered Universal RSS Subscription Manager | AI 驱动的全平台 RSS 订阅管理器**
 
