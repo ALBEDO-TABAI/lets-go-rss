@@ -1,0 +1,12 @@
+# Runtime data
+assets/rss_database.db
+assets/*.xml
+assets/*.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
