@@ -2,9 +2,9 @@
 
 > **AI-Powered Universal RSS Subscription Manager | AI 驱动的全平台 RSS 订阅管理器**
 
-A lightweight RSS aggregator designed to work as a **Claude Skill** inside AI-powered IDEs and agents. Add subscriptions from 7 platforms, auto-update with deduplication, and get digest reports — all through simple CLI commands that your AI assistant can run for you.
+A lightweight RSS aggregator designed to work as a **Claude Skill** inside AI-powered IDEs and agents. Add subscriptions from 7 platforms（YouTube, Vimeo, Behance, Bilibili, Weibo微博, Douyin抖音, Xiaohongshu小红书）, auto-update with deduplication, and get digest reports — all through simple CLI commands that your AI assistant can run for you.
 
-一个轻量级 RSS 聚合工具，设计为 **Claude Skill** 在 AI IDE 和 Agent 中运行。支持 7 个平台的订阅管理、自动更新去重、智能摘要推送——通过简单的命令行指令，让你的 AI 助手自动完成。
+一个轻量级 RSS 聚合工具，设计为 **Claude Skill** 在 AI IDE 和 Agent 中运行。支持 7 个平台（YouTube, Vimeo, Behance, Bilibili, Weibo微博, Douyin抖音, Xiaohongshu小红书）的订阅管理、自动更新去重、智能摘要推送——通过简单的命令行指令，让你的 AI 助手自动完成。
 
 ---
 
