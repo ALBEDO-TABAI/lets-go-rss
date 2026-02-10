@@ -13,6 +13,7 @@ Environment variables:
 import re
 import os
 import json
+import hashlib
 import subprocess
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
@@ -86,7 +87,7 @@ class NativeRSSScraper(BaseScraper):
                            else updated_el.text if updated_el is not None else "")
                 description = summary_el.text if summary_el is not None and summary_el.text else ""
 
-                item_id = f"{platform}_{hash(link) % 10**10}"
+                item_id = f"{platform}_{hashlib.md5(link.encode()).hexdigest()[:12]}"
                 items.append({
                     "item_id": item_id,
                     "title": title.strip(),
@@ -116,7 +117,7 @@ class NativeRSSScraper(BaseScraper):
                 # Strip HTML tags from description for cleaner text
                 clean_desc = re.sub(r'<[^>]+>', '', description)[:500]
 
-                item_id = f"{platform}_{hash(guid) % 10**10}"
+                item_id = f"{platform}_{hashlib.md5(guid.encode()).hexdigest()[:12]}"
                 items.append({
                     "item_id": item_id,
                     "title": title.strip(),

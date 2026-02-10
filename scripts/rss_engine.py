@@ -25,9 +25,17 @@ class RSSEngine:
     def __init__(self, db_path: str = "rss_database.db", use_llm: bool = True):
         self.db = RSSDatabase(db_path)
         self.scraper_factory = ScraperFactory()
-        self.classifier = get_classifier(use_llm)
+        self._use_llm = use_llm
+        self._classifier = None  # lazy init
         self.rss_generator = RSSGenerator()
         self.report_generator = MarkdownReportGenerator()
+
+    @property
+    def classifier(self):
+        """Lazy-load classifier only when needed."""
+        if self._classifier is None:
+            self._classifier = get_classifier(self._use_llm)
+        return self._classifier
 
     def add_subscription(self, url: str) -> bool:
         """Add a new subscription"""

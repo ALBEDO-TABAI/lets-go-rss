@@ -31,8 +31,9 @@ def check_and_install_dependencies():
 
     for requirement in requirements:
         package_name = requirement.split('==')[0].split('>=')[0].split('<=')[0]
+        import_name = package_name.replace('-', '_')  # pip name → import name
         try:
-            __import__(package_name)
+            __import__(import_name)
             print(f"  ✓ {package_name}")
         except ImportError:
             missing_packages.append(requirement)

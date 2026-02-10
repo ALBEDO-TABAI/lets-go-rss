@@ -6,7 +6,6 @@ Classifies RSS items into categories using AI
 import os
 import json
 from typing import List, Dict, Any, Optional
-import anthropic
 
 
 class ContentClassifier:
@@ -16,6 +15,11 @@ class ContentClassifier:
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
 
         self.client = anthropic.Anthropic(api_key=self.api_key)
 
