@@ -1,7 +1,11 @@
-# Runtime data
+# Runtime generated files
 assets/rss_database.db
 assets/*.xml
 assets/*.md
+*.xml
+*.opml
+latest_update.md
+summary.md
 
 # Python
 __pycache__/
