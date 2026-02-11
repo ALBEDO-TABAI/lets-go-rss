@@ -169,6 +169,20 @@ class RSSEngine:
         if not items:
             return []
 
+        # Auto-update subscription title from feed channel name
+        first_meta = items[0].get("metadata", {}) or {}
+        channel_name = first_meta.get("_channel_title") or first_meta.get("channel") or ""
+        if channel_name:
+            # Clean up platform-specific suffixes
+            import re as _re
+            channel_name = _re.sub(r'\s*的\s*bilibili\s*空间$', '', channel_name)
+            channel_name = _re.sub(r'\s*的微博$', '', channel_name)
+            channel_name = _re.sub(r'^Vimeo\s*/\s*', '', channel_name)
+            channel_name = _re.sub(r"['\u2019]s\s*videos$", '', channel_name)
+            channel_name = channel_name.strip()
+        if channel_name:
+            self.db.update_subscription_title(subscription_id, channel_name)
+
         # Filter out existing items and classify new ones
         new_items = []
 

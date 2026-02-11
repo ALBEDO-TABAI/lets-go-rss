@@ -199,6 +199,16 @@ class RSSDatabase:
             """, (subscription_id,))
             conn.commit()
 
+    def update_subscription_title(self, subscription_id: int, title: str):
+        """Auto-update subscription title from feed channel name."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE subscriptions SET title = ?
+                WHERE id = ? AND (title LIKE '%Subscription%' OR title = '')
+            """, (title, subscription_id))
+            conn.commit()
+
     def get_all_items(self) -> List[Dict[str, Any]]:
         """Get all items for RSS feed generation"""
         with sqlite3.connect(self.db_path) as conn:

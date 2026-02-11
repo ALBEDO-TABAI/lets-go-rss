@@ -73,6 +73,10 @@ class NativeRSSScraper(BaseScraper):
         media_ns = "http://search.yahoo.com/mrss/"
 
         if root.tag == f"{{{atom_ns}}}feed" or root.tag == "feed":
+            # Extract feed/channel title
+            feed_title_el = root.find(f"{{{atom_ns}}}title")
+            channel_title = feed_title_el.text.strip() if feed_title_el is not None and feed_title_el.text else ""
+
             entries = root.findall(f"{{{atom_ns}}}entry")
             for entry in entries[:20]:
                 title_el = entry.find(f"{{{atom_ns}}}title")
@@ -94,11 +98,16 @@ class NativeRSSScraper(BaseScraper):
                     "description": description[:500] if description else "",
                     "link": link,
                     "pub_date": pub_date,
-                    "metadata": {}
+                    "metadata": {"_channel_title": channel_title}
                 })
         else:
             # RSS 2.0 format
             channel = root.find("channel")
+            # Extract channel title
+            channel_title = ""
+            if channel is not None:
+                ch_title_el = channel.find("title")
+                channel_title = ch_title_el.text.strip() if ch_title_el is not None and ch_title_el.text else ""
             item_elements = channel.findall("item") if channel is not None else root.findall(".//item")
 
             for item_el in item_elements[:20]:
@@ -124,7 +133,7 @@ class NativeRSSScraper(BaseScraper):
                     "description": clean_desc.strip(),
                     "link": link,
                     "pub_date": pub_date,
-                    "metadata": {}
+                    "metadata": {"_channel_title": channel_title}
                 })
 
         return items
