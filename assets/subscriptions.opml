@@ -2,7 +2,7 @@
 <opml version="2.0">
   <head>
     <title>Universal RSS Subscriptions</title>
-    <dateCreated>Wed, 11 Feb 2026 12:44:05 +0000</dateCreated>
+    <dateCreated>Wed, 11 Feb 2026 16:55:49 +0000</dateCreated>
   </head>
   <body>
     <outline text="Bilibili" title="Bilibili">
@@ -17,11 +17,11 @@
       <outline type="rss" text="xiaohongshu Subscription" title="xiaohongshu Subscription" xmlUrl="https://www.xiaohongshu.com/user/profile/5b6af7459e8ccb000181bd60" htmlUrl="https://www.xiaohongshu.com/user/profile/5b6af7459e8ccb000181bd60"/>
     </outline>
     <outline text="Weibo" title="Weibo">
-      <outline type="rss" text="weibo Subscription" title="weibo Subscription" xmlUrl="https://weibo.com/u/6182606334" htmlUrl="https://weibo.com/u/6182606334"/>
+      <outline type="rss" text="歸藏的AI工具箱" title="歸藏的AI工具箱" xmlUrl="https://weibo.com/u/6182606334" htmlUrl="https://weibo.com/u/6182606334"/>
     </outline>
     <outline text="Vimeo" title="Vimeo">
-      <outline type="rss" text="vimeo Subscription" title="vimeo Subscription" xmlUrl="https://vimeo.com/xkstudio" htmlUrl="https://vimeo.com/xkstudio"/>
-      <outline type="rss" text="vimeo Subscription" title="vimeo Subscription" xmlUrl="https://vimeo.com/offf" htmlUrl="https://vimeo.com/offf"/>
+      <outline type="rss" text="XK studio" title="XK studio" xmlUrl="https://vimeo.com/xkstudio" htmlUrl="https://vimeo.com/xkstudio"/>
+      <outline type="rss" text="OFFF Festival" title="OFFF Festival" xmlUrl="https://vimeo.com/offf" htmlUrl="https://vimeo.com/offf"/>
     </outline>
     <outline text="Behance" title="Behance">
       <outline type="rss" text="Yokohara Hirokazu" title="Yokohara Hirokazu" xmlUrl="https://www.behance.net/yokohara6e48" htmlUrl="https://www.behance.net/yokohara6e48"/>

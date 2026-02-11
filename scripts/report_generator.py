@@ -3,6 +3,7 @@ Markdown report generator
 Creates formatted latest_update.md with categorized content
 """
 
+import os
 from typing import List, Dict, Any
 from datetime import datetime
 from collections import defaultdict
@@ -36,7 +37,7 @@ class MarkdownReportGenerator:
         if not new_items:
             content = self._generate_empty_report()
         elif digest:
-            content = self._generate_digest_report(new_items)
+            content = self._generate_digest_report(new_items, output_dir=os.path.dirname(output_path) or ".")
         else:
             content = self._generate_full_report(new_items)
 
@@ -45,37 +46,67 @@ class MarkdownReportGenerator:
 
         return output_path
 
-    def _generate_digest_report(self, new_items: List[Dict[str, Any]]) -> str:
-        """Generate digest report — latest 1 item per subscription account."""
-        # Group by subscription_url (= per account)
+    def _generate_digest_report(self, new_items: List[Dict[str, Any]],
+                                output_dir: str = ".") -> str:
+        """Generate digest report — only items that changed since last digest."""
+        import json
         from collections import OrderedDict
+
+        # Group by subscription_url (= per account), keep newest
         by_account = OrderedDict()
         for item in new_items:
             key = item.get("subscription_url", item.get("platform", "unknown"))
             if key not in by_account:
-                by_account[key] = item  # keep only the first (newest)
+                by_account[key] = item
+
+        # Load previous digest snapshot
+        snapshot_path = os.path.join(output_dir, "last_digest.json")
+        prev_snapshot = {}
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as f:
+                prev_snapshot = json.load(f)  # {sub_url: item_id}
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        # Find truly changed items
+        changed = OrderedDict()
+        current_snapshot = {}
+        for sub_url, item in by_account.items():
+            item_id = item.get("item_id", "")
+            current_snapshot[sub_url] = item_id
+            if item_id != prev_snapshot.get(sub_url):
+                changed[sub_url] = item
+
+        # Save current snapshot for next comparison
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            json.dump(current_snapshot, f, ensure_ascii=False)
+
+        # No changes since last digest
+        if not changed:
+            return self._generate_empty_report()
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines = [
             "# RSS 更新摘要",
             "",
-            f"**时间**: {now}　|　**新内容**: {len(by_account)} 个账号有更新",
+            f"**时间**: {now}　|　**新内容**: {len(changed)} 个账号有更新",
             "",
         ]
 
-        for sub_url, item in by_account.items():
+        for sub_url, item in changed.items():
             platform = item.get("platform", "").lower()
             emoji = self.platform_emojis.get(platform, "🔗")
             title = item.get("title", "Untitled")
             link = item.get("link", "")
-            # Show account name if available
             sub_title = item.get("subscription_title", "")
-            account = f"**{sub_title}** " if sub_title and "Subscription" not in sub_title else ""
+            account = sub_title if sub_title and "Subscription" not in sub_title else ""
 
-            if link:
-                lines.append(f"- {emoji} {account}[{title}]({link})")
+            if account:
+                lines.append(f"- {emoji} [{account}] {title}")
             else:
-                lines.append(f"- {emoji} {account}{title}")
+                lines.append(f"- {emoji} {title}")
+            if link:
+                lines.append(f"  {link}")
 
         lines.append("")
         lines.append("---")
