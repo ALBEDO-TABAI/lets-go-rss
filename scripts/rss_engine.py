@@ -123,21 +123,29 @@ class RSSEngine:
         errors = sum(1 for r in results.values() if r[1])
         print(f"\n✅ Done in {elapsed:.1f}s | +{total_new} new | {errors} errors\n")
 
+        # Output directory = same dir as database (assets/)
+        out_dir = os.path.dirname(self.db.db_path) or "."
+
         # Generate RSS feeds
         print("📝 Generating outputs...")
         all_items = self.db.get_all_items()
-        feed_paths = self.rss_generator.create_categorized_feeds(all_items, ".")
+        feed_paths = self.rss_generator.create_categorized_feeds(all_items, out_dir)
         print(f"✓ {len(feed_paths)} RSS feeds")
 
         opml_gen = OPMLGenerator()
-        opml_gen.create_opml(subscriptions, "subscriptions.opml")
+        opml_gen.create_opml(subscriptions, os.path.join(out_dir, "subscriptions.opml"))
         print("✓ OPML")
 
-        new_items_with_details = self.db.get_new_items_since(update_start)
-        self.report_generator.generate_update_report(new_items_with_details, "latest_update.md", digest=digest)
+        if digest:
+            # Digest mode: always show latest 1 item per subscription (by pub_date)
+            report_items = self.db.get_latest_per_subscription()
+        else:
+            # Full mode: show only items fetched in this update cycle
+            report_items = self.db.get_new_items_since(update_start)
+        self.report_generator.generate_update_report(report_items, os.path.join(out_dir, "latest_update.md"), digest=digest)
         print("✓ latest_update.md")
 
-        self.report_generator.generate_summary_report(self.db, "summary.md")
+        self.report_generator.generate_summary_report(self.db, os.path.join(out_dir, "summary.md"))
         print("✓ summary.md")
 
         return {
