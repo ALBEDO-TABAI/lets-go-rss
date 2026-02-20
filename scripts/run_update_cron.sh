@@ -52,6 +52,11 @@ pick_python_with_httpx() {
 }
 
 cd "${ROOT_DIR}"
+if [[ -f "${ROOT_DIR}/.env" ]]; then
+  set -a
+  source "${ROOT_DIR}/.env"
+  set +a
+fi
 echo "===== [$(date '+%Y-%m-%d %H:%M:%S %z')] run_update_cron start ====="
 SELECTED_PYTHON="$(pick_python_with_httpx || true)"
 if [[ -z "${SELECTED_PYTHON}" ]]; then

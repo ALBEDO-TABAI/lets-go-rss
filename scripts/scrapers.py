@@ -12,15 +12,17 @@ Environment variables:
 
 import re
 import os
+import sys
 import json
 import hashlib
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import time
 import httpx
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 
 # ============================================================
@@ -243,7 +245,14 @@ class BehanceScraper(NativeRSSScraper):
             response = self.get(rss_url)
             return self.parse_rss_xml(response.text, "behance")
         except Exception as e:
-            self.last_error = str(e)
+            err = str(e)
+            # Behance occasionally rate-limits with empty 403 responses.
+            # Treat as temporary skip (no new items) instead of hard failure.
+            if "403" in err:
+                print("    ⚠️  Behance temporarily rate-limited (403), skip this cycle")
+                self.last_error = None
+                return []
+            self.last_error = err
             print(f"    ❌ Behance RSS fetch failed: {e}")
             return []
 
@@ -254,6 +263,69 @@ class BehanceScraper(NativeRSSScraper):
 
 class YouTubeScraper(BaseScraper):
     """YouTube scraper — uses yt-dlp for reliable metadata extraction"""
+
+    def _fetch_via_native_feed(self, channel_ref: str) -> List[Dict[str, Any]]:
+        """Fallback: parse YouTube Atom feed directly.
+
+        Useful when yt-dlp is blocked by bot checks.
+        """
+        channel_id = ""
+        if channel_ref.startswith("UC"):
+            channel_id = channel_ref
+        else:
+            # Resolve channel_id from HTML page (externalId / browseId)
+            if channel_ref.startswith("@"):
+                page_url = f"https://www.youtube.com/{channel_ref}/videos"
+            else:
+                page_url = f"https://www.youtube.com/channel/{channel_ref}/videos"
+            try:
+                resp = self.get(page_url, timeout=max(self.timeout, 12), retries=2)
+                text = resp.text
+                m = re.search(r'"externalId":"([A-Za-z0-9_-]+)"', text)
+                if not m:
+                    m = re.search(r'"browseId":"(UC[A-Za-z0-9_-]+)"', text)
+                if m:
+                    channel_id = m.group(1)
+            except Exception:
+                channel_id = ""
+
+        if not channel_id:
+            return []
+
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+        try:
+            response = self.get(feed_url, timeout=max(self.timeout, 12), retries=2)
+            parser = NativeRSSScraper()
+            items = parser.parse_rss_xml(response.text, "youtube")
+            if items:
+                print(f"    ✓ YouTube fallback feed: {len(items)} items")
+            return items
+        except Exception:
+            return []
+
+    def _resolve_ytdlp_bin(self) -> Optional[str]:
+        """Find yt-dlp binary from PATH / venv / python -m yt_dlp fallback."""
+        # 1) Direct binary in current PATH
+        ytdlp_bin = shutil.which("yt-dlp")
+        if ytdlp_bin:
+            return ytdlp_bin
+
+        # 2) Binary next to current python executable (venv/bin/yt-dlp)
+        py_dir = os.path.dirname(sys.executable)
+        candidates = [
+            os.path.join(py_dir, "yt-dlp"),
+            os.path.join(py_dir, "yt_dlp"),
+        ]
+        for c in candidates:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+
+        # 3) If yt_dlp module import works, use `python -m yt_dlp`
+        try:
+            import yt_dlp  # noqa: F401
+            return "__PYTHON_MODULE__"
+        except Exception:
+            return None
 
     def extract_channel_id(self, url: str) -> Optional[str]:
         """Extract @handle or channel path from YouTube URL"""
@@ -295,24 +367,42 @@ class YouTubeScraper(BaseScraper):
             "%(description).500s",
         ])
 
+        # Resolve binary robustly in cron / venv environments.
+        ytdlp_bin = self._resolve_ytdlp_bin()
+        if not ytdlp_bin:
+            self.last_error = "yt-dlp not found"
+            print("    ❌ yt-dlp not found. Install: pip install yt-dlp")
+            return []
+
         try:
-            ytdlp_timeout = int(os.environ.get("RSS_YTDLP_TIMEOUT", "20"))
+            ytdlp_timeout = max(20, int(os.environ.get("RSS_YTDLP_TIMEOUT", "30")))
+            cmd = [
+                "--print", PRINT_FORMAT,
+                "--playlist-items", "1:15",
+                "--no-warnings",
+                videos_url,
+            ]
+            if ytdlp_bin == "__PYTHON_MODULE__":
+                run_cmd = [sys.executable, "-m", "yt_dlp", *cmd]
+            else:
+                run_cmd = [ytdlp_bin, *cmd]
+
             result = subprocess.run(
-                [
-                    "yt-dlp",
-                    "--print", PRINT_FORMAT,
-                    "--playlist-items", "1:15",
-                    "--no-warnings",
-                    videos_url,
-                ],
+                run_cmd,
                 capture_output=True,
                 text=True,
                 timeout=ytdlp_timeout,
             )
 
             if result.returncode != 0:
-                self.last_error = result.stderr[:200] or "yt-dlp returned non-zero status"
-                print(f"    ⚠️  yt-dlp error: {result.stderr[:200]}")
+                err_text = result.stderr[:200] or "yt-dlp returned non-zero status"
+                print(f"    ⚠️  yt-dlp error: {err_text}")
+                # Fallback for bot-check / transient yt-dlp failures.
+                fallback_items = self._fetch_via_native_feed(channel_ref)
+                if fallback_items:
+                    self.last_error = None
+                    return fallback_items
+                self.last_error = err_text
                 return []
 
             items = []
@@ -363,14 +453,18 @@ class YouTubeScraper(BaseScraper):
         except subprocess.TimeoutExpired:
             self.last_error = "yt-dlp timed out"
             print(f"    ❌ yt-dlp timed out ({ytdlp_timeout}s)")
-            return []
-        except FileNotFoundError:
-            self.last_error = "yt-dlp not found"
-            print("    ❌ yt-dlp not found. Install: pip install yt-dlp")
+            fallback_items = self._fetch_via_native_feed(channel_ref)
+            if fallback_items:
+                self.last_error = None
+                return fallback_items
             return []
         except Exception as e:
             self.last_error = str(e)
             print(f"    ❌ YouTube fetch error: {e}")
+            fallback_items = self._fetch_via_native_feed(channel_ref)
+            if fallback_items:
+                self.last_error = None
+                return fallback_items
             return []
 
 
@@ -401,7 +495,7 @@ class BilibiliScraper(RSSHubScraper):
         video_url = f"{self.RSSHUB_BASE}/bilibili/user/video/{user_id}"
         print(f"    📡 RSSHub: {video_url}")
         try:
-            response = self.get(video_url)
+            response = self.get(video_url, timeout=max(self.timeout, 12), retries=3)
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 items = self.parse_rss_xml(response.text, "bilibili")
@@ -414,13 +508,18 @@ class BilibiliScraper(RSSHubScraper):
                 dynamic_url = f"{self.RSSHUB_BASE}/bilibili/user/dynamic/{user_id}"
                 print(f"    ⚠️  Video route blocked, trying dynamic: {dynamic_url}")
                 try:
-                    response = self.get(dynamic_url)
+                    response = self.get(dynamic_url, timeout=max(self.timeout, 12), retries=3)
                     ct = response.headers.get("content-type", "")
                     if "xml" in ct or "rss" in ct:
                         items = self.parse_rss_xml(response.text, "bilibili")
                         if items:
                             return items
                 except Exception as e2:
+                    # Treat repeated 503 as temporary skip to avoid noisy hard failures.
+                    if "503" in str(e2):
+                        print("    ⚠️  Bilibili RSSHub temporarily unavailable (503), skip this cycle")
+                        self.last_error = None
+                        return []
                     self.last_error = f"Both routes failed: video={err_msg[:60]}, dynamic={e2}"
                     print(f"    ❌ Dynamic fallback also failed: {e2}")
                     return []
@@ -514,14 +613,107 @@ class XiaohongshuScraper(BaseScraper):
             self.last_error = f"Cannot extract XHS user ID from {url}"
             return []
 
-        # Try Playwright with rednote-mcp cookies
+        # 1) Try direct HTML profile parse first (fast, no browser dependency).
+        items = self._fetch_via_html_profile(user_id)
+        if items:
+            return items
+
+        # 2) Try Playwright with rednote-mcp cookies.
         if self._pw_cookies:
             items = self._fetch_via_playwright(user_id)
             if items:
                 return items
 
-        # Fallback: RSSHub
+        # 3) Fallback: RSSHub
         return self._fetch_via_rsshub(user_id)
+
+    def _fetch_via_html_profile(self, user_id: str) -> List[Dict[str, Any]]:
+        """Fetch XHS notes from SSR initial-state JSON in profile HTML.
+
+        This route avoids Playwright dependency and works when note list is server-rendered.
+        """
+        profile_url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+        print(f"    📡 XHS HTML: {profile_url}")
+        try:
+            response = self.get(profile_url, timeout=max(self.timeout, 12), retries=2)
+            html = response.text
+            m = re.search(r"__INITIAL_STATE__=(\{.*?\})</script>", html, re.S)
+            if not m:
+                return []
+
+            # XHS embeds `undefined`; normalize to valid JSON.
+            json_text = re.sub(r":undefined([,}])", r":null\1", m.group(1))
+            state = json.loads(json_text)
+
+            user_obj = state.get("user", {}) if isinstance(state, dict) else {}
+            notes_groups = user_obj.get("notes", [])
+            if not notes_groups:
+                return []
+
+            # Usually a nested list: user.notes[0] is the current tab notes.
+            notes = notes_groups[0] if isinstance(notes_groups[0], list) else notes_groups
+            items: List[Dict[str, Any]] = []
+
+            author = ""
+            user_info = user_obj.get("userInfo", {}) if isinstance(user_obj, dict) else {}
+            if isinstance(user_info, dict):
+                author = user_info.get("nickname") or user_info.get("nickName") or ""
+
+            for note in notes[:20]:
+                if not isinstance(note, dict):
+                    continue
+                card = note.get("noteCard", {}) if isinstance(note.get("noteCard"), dict) else {}
+                title = (card.get("displayTitle") or "").strip()
+                if not title:
+                    continue
+
+                # noteId may be empty in SSR; recover from cover URL when possible.
+                note_id = (card.get("noteId") or note.get("id") or "").strip()
+                cover = card.get("cover", {}) if isinstance(card.get("cover"), dict) else {}
+                cover_url = cover.get("urlPre") or cover.get("urlDefault") or cover.get("url") or ""
+                if not note_id and cover_url:
+                    mm = re.search(r"/([0-9a-zA-Z]{16,32})!", cover_url)
+                    if mm:
+                        note_id = mm.group(1)
+
+                xsec_token = (card.get("xsecToken") or note.get("xsecToken") or "").strip()
+
+                if note_id:
+                    link = f"https://www.xiaohongshu.com/explore/{note_id}"
+                elif xsec_token:
+                    link = f"https://www.xiaohongshu.com/user/profile/{user_id}?xsec_token={unquote(xsec_token)}&xsec_source=pc_user"
+                else:
+                    link = profile_url
+
+                # Stable fallback id even when note_id is absent.
+                unique_seed = note_id or f"{title}|{cover_url}|{xsec_token}"
+                item_id = f"xiaohongshu_{hashlib.md5(unique_seed.encode()).hexdigest()[:12]}"
+
+                note_author = ""
+                n_user = card.get("user", {}) if isinstance(card.get("user"), dict) else {}
+                if isinstance(n_user, dict):
+                    note_author = n_user.get("nickname") or n_user.get("nickName") or ""
+
+                items.append({
+                    "item_id": item_id,
+                    "title": title,
+                    "description": "",
+                    "link": link,
+                    "pub_date": "",
+                    "metadata": {
+                        "_channel_title": note_author or author,
+                        "note_id": note_id,
+                        "cover_url": cover_url,
+                        "liked_count": (card.get("interactInfo", {}) or {}).get("likedCount", ""),
+                    },
+                })
+
+            if items:
+                print(f"  ✓ XHS: {len(items)} notes via HTML")
+            return items
+        except Exception as e:
+            print(f"    ⚠️  XHS HTML parse failed: {e}")
+            return []
 
     def _fetch_via_playwright(self, user_id: str) -> List[Dict[str, Any]]:
         """Fetch user notes by intercepting XHR in a headless browser."""
@@ -724,15 +916,28 @@ class XiaohongshuScraper(BaseScraper):
         rsshub_url = f"{self.RSSHUB_BASE}/xiaohongshu/user/{user_id}/notes"
         print(f"    📡 RSSHub fallback: {rsshub_url}")
         try:
-            response = self.get(rsshub_url, timeout=6, retries=1)
+            response = self.get(
+                rsshub_url,
+                timeout=max(self.timeout, 10),
+                retries=max(2, int(os.environ.get("RSS_XHS_RETRIES", "1"))),
+            )
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 parser = NativeRSSScraper()
                 return parser.parse_rss_xml(response.text, "xiaohongshu")
             else:
+                # Avoid hard-failing whole cycle on common 503 anti-bot pages.
+                if response.status_code == 503:
+                    print("    ⚠️  XHS RSSHub temporarily unavailable (503), skip this cycle")
+                    self.last_error = None
+                    return []
                 self.last_error = f"Non-RSS content from RSSHub (HTTP {response.status_code})"
                 return []
         except Exception as e:
+            if "503" in str(e):
+                print("    ⚠️  XHS RSSHub temporarily unavailable (503), skip this cycle")
+                self.last_error = None
+                return []
             self.last_error = str(e)
             print(f"    ❌ RSSHub fallback also failed: {e}")
             return []
