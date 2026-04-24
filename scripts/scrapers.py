@@ -7,7 +7,10 @@ Architecture:
 - Tier 2 (RSSHub):     Bilibili, Weibo, Douyin, Xiaohongshu — via local RSSHub
 
 Environment variables:
-- RSSHUB_BASE_URL: Base URL of self-hosted RSSHub (default: http://localhost:1200)
+- RSSHUB_BASE_URL_PRIMARY:  Primary RSSHub URL (default http://localhost:1201 — skill-owned via rsshub_manager)
+- RSSHUB_BASE_URL_FALLBACK: Fallback RSSHub URL (default http://localhost:1200 — ready-cowork's embedded worker)
+- RSSHUB_BASE_URL:          Legacy single-base; appended to the list if set
+- RSS_NOTIFY_MACOS=0 to disable macOS notifications (default on)
 """
 
 import re
@@ -15,12 +18,163 @@ import os
 import json
 import hashlib
 import subprocess
+import sys
+import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import time
 import httpx
 from urllib.parse import urlparse, parse_qs
+from chrome_session_bridge import ChromeSessionBridge, ChromeSessionUnavailable
+
+
+# ============================================================
+#  Utilities
+# ============================================================
+
+def notify_macos(title: str, message: str, subtitle: Optional[str] = None,
+                 dedupe_key: Optional[str] = None) -> None:
+    """Post a macOS notification via osascript.
+
+    No-op on non-darwin, or when RSS_NOTIFY_MACOS=0 is set. `dedupe_key`, when
+    provided, suppresses duplicate notifications with the same key for 24h
+    (uses a tmp-file semaphore under ${TMPDIR}/rss_notify_<key>).
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("RSS_NOTIFY_MACOS", "1") == "0":
+        return
+
+    if dedupe_key:
+        import tempfile
+        sem_path = os.path.join(
+            tempfile.gettempdir(),
+            f"rss_notify_{hashlib.md5(dedupe_key.encode()).hexdigest()[:12]}",
+        )
+        try:
+            mtime = os.path.getmtime(sem_path)
+            if time.time() - mtime < 24 * 3600:
+                return  # dedup window still active
+        except OSError:
+            pass
+        try:
+            with open(sem_path, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
+    # AppleScript string quoting: escape double quotes and backslashes.
+    def _q(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    parts = [f'display notification "{_q(message)}" with title "{_q(title)}"']
+    if subtitle:
+        parts.append(f'subtitle "{_q(subtitle)}"')
+    script = " ".join(parts)
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            timeout=3, capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+#  RSSHub client — double-base with circuit breaker
+# ============================================================
+
+class _RSSHubClient:
+    """Tries a list of RSSHub base URLs in order. On connect-refused or 503,
+    short-circuits that base for BLACKLIST_WINDOW_SEC so the next call skips
+    it immediately rather than paying the timeout again.
+
+    Bases (in order):
+      1. RSSHUB_BASE_URL_PRIMARY   (default http://localhost:1201 — skill-owned)
+      2. RSSHUB_BASE_URL_FALLBACK  (default http://localhost:1200 — ready-cowork)
+      3. RSSHUB_BASE_URL           (legacy single-base env var; appended if set)
+    """
+
+    BLACKLIST_WINDOW_SEC = 600
+    FAIL_THRESHOLD = 3
+
+    def __init__(self):
+        primary = os.environ.get("RSSHUB_BASE_URL_PRIMARY", "http://localhost:1201")
+        fallback = os.environ.get("RSSHUB_BASE_URL_FALLBACK", "http://localhost:1200")
+        legacy = os.environ.get("RSSHUB_BASE_URL")
+        seen = set()
+        self.bases = []
+        for b in (primary, fallback, legacy):
+            if b and b not in seen:
+                self.bases.append(b)
+                seen.add(b)
+        self._state = {b: {"fails": 0, "blocked_until": 0.0} for b in self.bases}
+
+    def _is_transient(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "errno 61" in msg
+            or "connection refused" in msg
+            or "503" in msg
+            or "service unavailable" in msg
+            or "disconnected" in msg
+        )
+
+    def fetch(self, route: str, scraper: "BaseScraper",
+              require_rss: bool = True) -> "httpx.Response":
+        """Try each base in order using scraper.get (retains its headers/retry).
+
+        When `require_rss` is True (default), a 200 response whose content-type
+        does not look like XML/RSS is treated as a soft failure and the next
+        base is tried — this catches RSSHub's JSON error envelopes that come
+        back with 200 for some route failure modes.
+
+        Raises the final exception / returns the final non-RSS response when
+        all bases have been tried.
+        """
+        last_err: Optional[Exception] = None
+        last_non_rss: Optional["httpx.Response"] = None
+        tried_any = False
+        for base in self.bases:
+            st = self._state[base]
+            if time.time() < st["blocked_until"]:
+                continue
+            tried_any = True
+            url = f"{base}{route}"
+            try:
+                response = scraper.get(url)
+            except Exception as e:
+                last_err = e
+                if self._is_transient(e):
+                    st["fails"] += 1
+                    if st["fails"] >= self.FAIL_THRESHOLD:
+                        st["blocked_until"] = time.time() + self.BLACKLIST_WINDOW_SEC
+                        st["fails"] = 0
+                    continue
+                raise
+            # Success at HTTP layer — validate content if required
+            if require_rss:
+                ct = response.headers.get("content-type", "").lower()
+                if "xml" not in ct and "rss" not in ct:
+                    last_non_rss = response
+                    continue  # try next base, don't count as a transient fail
+            st["fails"] = 0
+            st["blocked_until"] = 0.0
+            return response
+
+        # No base returned a usable response.
+        if not tried_any:
+            raise RuntimeError("All RSSHub bases are currently blacklisted")
+        if last_non_rss is not None:
+            # All bases returned 200 but nothing RSS-shaped. Return the last one
+            # so the caller can surface its status/body.
+            return last_non_rss
+        assert last_err is not None
+        raise last_err
+
+
+# Module singleton — all RSSHub calls go through this.
+rsshub_client = _RSSHubClient()
 
 
 # ============================================================
@@ -44,23 +198,66 @@ class BaseScraper:
         self.retry_backoff = float(os.environ.get("RSS_HTTP_BACKOFF", "0.8"))
         self.last_error = None
 
+    def _should_try_browser_fallback(self, error: str) -> bool:
+        text = (error or "").lower()
+        return (
+            "503" in text
+            or "service unavailable" in text
+            or "cooling down before new visitor cookies" in text
+            or "captcha" in text
+            or "风控" in text
+        )
+
+    def _is_connect_refused(self, exc: Exception) -> bool:
+        """Detect connection-refused errors (errno 61 on macOS, common during
+        RSSHub worker restart windows)."""
+        msg = str(exc).lower()
+        if "errno 61" in msg or "connection refused" in msg:
+            return True
+        try:
+            if isinstance(exc, httpx.ConnectError):
+                return True
+        except Exception:
+            pass
+        return False
+
     def get(self, url: str, headers: Optional[Dict] = None,
             timeout: Optional[float] = None,
             retries: Optional[int] = None) -> httpx.Response:
-        """Make GET request with retry logic"""
-        request_timeout = timeout if timeout is not None else self.timeout
-        max_retries = max(1, retries if retries is not None else self.max_retries)
+        """Make GET request with retry logic.
+
+        On top of the normal retry budget, grants ONE extra attempt specifically
+        for ECONNREFUSED (worker restart window ~1-3s on embedded RSSHub).
+
+        If the scraper is tagged as unhealthy (`_adaptive_health_hint >= 3`),
+        the budget is squeezed: short timeout, no retry — so a chronically
+        failing source does not dominate overall run time.
+        """
+        health = int(getattr(self, "_adaptive_health_hint", 0) or 0)
+        if health >= 3:
+            request_timeout = min(timeout if timeout is not None else self.timeout, 4.0)
+            max_retries = 1
+        else:
+            request_timeout = timeout if timeout is not None else self.timeout
+            max_retries = max(1, retries if retries is not None else self.max_retries)
         request_headers = {**self.headers, **(headers or {})}
-        for attempt in range(max_retries):
+        attempt = 0
+        extra_retry_used = False
+        while True:
             try:
                 with httpx.Client(timeout=request_timeout, follow_redirects=True) as client:
                     response = client.get(url, headers=request_headers)
                     response.raise_for_status()
                     return response
-            except Exception:
-                if attempt == max_retries - 1:
+            except Exception as e:
+                attempt += 1
+                if attempt >= max_retries:
+                    if self._is_connect_refused(e) and not extra_retry_used:
+                        extra_retry_used = True
+                        time.sleep(2.0)
+                        continue
                     raise
-                time.sleep(self.retry_backoff * (attempt + 1))
+                time.sleep(self.retry_backoff * attempt)
 
 
 class NativeRSSScraper(BaseScraper):
@@ -149,8 +346,6 @@ class NativeRSSScraper(BaseScraper):
 class RSSHubScraper(NativeRSSScraper):
     """Base class for scrapers that fetch via self-hosted RSSHub"""
 
-    RSSHUB_BASE = os.environ.get("RSSHUB_BASE_URL", "http://localhost:1200")
-
     def __init__(self, route_template: str):
         super().__init__()
         self.route_template = route_template
@@ -160,7 +355,7 @@ class RSSHubScraper(NativeRSSScraper):
         raise NotImplementedError
 
     def fetch_items(self, url: str) -> List[Dict[str, Any]]:
-        """Fetch via RSSHub route"""
+        """Fetch via RSSHub route (double-base with circuit breaker)."""
         self.last_error = None
         user_id = self.extract_user_id(url)
         if not user_id:
@@ -168,16 +363,15 @@ class RSSHubScraper(NativeRSSScraper):
             self.last_error = f"Cannot extract user ID from {url}"
             return []
 
-        rsshub_url = f"{self.RSSHUB_BASE}{self.route_template.format(id=user_id)}"
-        print(f"    📡 RSSHub: {rsshub_url}")
+        route = self.route_template.format(id=user_id)
+        print(f"    📡 RSSHub: {route}")
 
         try:
-            response = self.get(rsshub_url)
+            response = rsshub_client.fetch(route, self)
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 return self.parse_rss_xml(response.text, self._platform_name())
             else:
-                # Might be an error page
                 print(f"    ⚠️  RSSHub returned non-RSS content (HTTP {response.status_code})")
                 self.last_error = f"Non-RSS content from RSSHub (HTTP {response.status_code})"
                 return []
@@ -441,55 +635,37 @@ class YouTubeScraper(BaseScraper):
 # ============================================================
 
 class BilibiliScraper(RSSHubScraper):
-    """Bilibili scraper via RSSHub — tries /video route first, falls back to /dynamic."""
+    """Bilibili scraper via RSSHub — uses /dynamic route (video route removed in RSSHub v1.0+)."""
 
     def __init__(self):
-        super().__init__("/bilibili/user/video/{id}")
-        self._fallback_route = "/bilibili/user/dynamic/{id}"
+        super().__init__("/bilibili/user/dynamic/{id}")
 
     def extract_user_id(self, url: str) -> Optional[str]:
         match = re.search(r"space\.bilibili\.com/(\d+)", url)
         return match.group(1) if match else None
 
     def fetch_items(self, url: str) -> List[Dict[str, Any]]:
-        """Try video route first; on 503 (anti-bot), fall back to dynamic route."""
+        """Fetch via /dynamic route. The /video route was removed in RSSHub v1.0."""
         self.last_error = None
         user_id = self.extract_user_id(url)
         if not user_id:
             self.last_error = f"Cannot extract Bilibili user ID from {url}"
             return []
 
-        # Try primary /video route
-        video_url = f"{self.RSSHUB_BASE}/bilibili/user/video/{user_id}"
-        print(f"    📡 RSSHub: {video_url}")
+        route = f"/bilibili/user/dynamic/{user_id}"
+        print(f"    📡 RSSHub: {route}")
         try:
-            response = self.get(video_url)
+            response = rsshub_client.fetch(route, self)
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 items = self.parse_rss_xml(response.text, "bilibili")
                 if items:
                     return items
+            self.last_error = "Non-RSS content from RSSHub (HTTP 200)"
+            print(f"    ⚠️  Bilibili: Non-RSS content from RSSHub (HTTP {response.status_code})")
         except Exception as e:
-            err_msg = str(e)
-            if "503" in err_msg or "风控" in err_msg:
-                # Anti-bot triggered, try dynamic route
-                dynamic_url = f"{self.RSSHUB_BASE}/bilibili/user/dynamic/{user_id}"
-                print(f"    ⚠️  Video route blocked, trying dynamic: {dynamic_url}")
-                try:
-                    response = self.get(dynamic_url)
-                    ct = response.headers.get("content-type", "")
-                    if "xml" in ct or "rss" in ct:
-                        items = self.parse_rss_xml(response.text, "bilibili")
-                        if items:
-                            return items
-                except Exception as e2:
-                    self.last_error = f"Both routes failed: video={err_msg[:60]}, dynamic={e2}"
-                    print(f"    ❌ Dynamic fallback also failed: {e2}")
-                    return []
-            self.last_error = err_msg
-            print(f"    ❌ RSSHub fetch failed: {e}")
-            return []
-
+            self.last_error = str(e)
+            print(f"    ❌ Bilibili fetch failed: {e}")
         return []
 
 
@@ -506,6 +682,184 @@ class WeiboScraper(RSSHubScraper):
             return match.group(1)
         match = re.search(r"weibo\.com/(\d+)", url)
         return match.group(1) if match else None
+
+    def fetch_items(self, url: str) -> List[Dict[str, Any]]:
+        items = super().fetch_items(url)
+        if items:
+            return items
+
+        if not self._should_try_browser_fallback(self.last_error or ""):
+            return []
+
+        api_items = self._fetch_via_logged_in_api(url)
+        if api_items:
+            self.last_error = None
+            return api_items
+
+        browser_items = self._fetch_via_browser(url)
+        if browser_items:
+            self.last_error = None
+            return browser_items
+        return []
+
+    def _fetch_via_logged_in_api(self, url: str) -> List[Dict[str, Any]]:
+        try:
+            import browser_cookie3
+        except Exception:
+            return []
+
+        user_id = self.extract_user_id(url)
+        if not user_id:
+            return []
+
+        try:
+            cookies = browser_cookie3.chrome(domain_name="weibo.cn")
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "X-Requested-With": "XMLHttpRequest",
+                "MWeibo-Pwa": "1",
+            }
+
+            profile_resp = httpx.get(
+                f"https://m.weibo.cn/api/container/getIndex?type=uid&value={user_id}",
+                headers=headers,
+                cookies={c.name: c.value for c in cookies},
+                timeout=20,
+            )
+            profile_resp.raise_for_status()
+            profile_data = profile_resp.json().get("data", {})
+            tabs = (profile_data.get("tabsInfo") or {}).get("tabs") or []
+            weibo_tab = next((tab for tab in tabs if tab.get("tabKey") == "weibo"), None)
+            container_id = (weibo_tab or {}).get("containerid") or f"107603{user_id}"
+
+            feed_resp = httpx.get(
+                f"https://m.weibo.cn/api/container/getIndex?containerid={container_id}",
+                headers=headers,
+                cookies={c.name: c.value for c in cookies},
+                timeout=20,
+            )
+            feed_resp.raise_for_status()
+            feed_data = feed_resp.json().get("data", {})
+            cards = feed_data.get("cards") or []
+            channel_title = ((profile_data.get("userInfo") or {}).get("screen_name")) or "微博账号"
+
+            items = []
+            for card in cards[:20]:
+                mblog = card.get("mblog") or {}
+                mid = str(mblog.get("mid") or mblog.get("id") or "")
+                if not mid:
+                    continue
+                text = re.sub(r"<[^>]+>", "", mblog.get("text", "")).strip()
+                title = text[:120] + "..." if len(text) > 120 else (text or f"微博动态 {mid[-6:]}")
+                items.append({
+                    "item_id": f"weibo_{hashlib.md5(mid.encode()).hexdigest()[:12]}",
+                    "title": title,
+                    "description": text[:500],
+                    "link": f"https://m.weibo.cn/status/{mid}",
+                    "pub_date": mblog.get("created_at", ""),
+                    "metadata": {
+                        "_channel_title": channel_title,
+                        "mid": mid,
+                    }
+                })
+            return items
+        except Exception as e:
+            self.last_error = f"微博登录态接口抓取失败: {e}"
+            return []
+
+    def _fetch_via_browser(self, url: str) -> List[Dict[str, Any]]:
+        user_id = self.extract_user_id(url)
+        if not user_id:
+            self.last_error = f"Cannot extract Weibo user ID from {url}"
+            return []
+
+        bridge = ChromeSessionBridge()
+
+        def _extract(page):
+            page_text = page.locator("body").inner_text()[:5000]
+            final_url = page.url
+            if "captcha" in final_url or "visitor.passport.weibo.cn" in final_url:
+                return {"error": "captcha"}
+            if "安全验证" in page_text or "环境异常" in page_text:
+                return {"error": "security_check"}
+            if "前方有点拥堵，请登录后使用" in page_text:
+                return {"error": "login_required"}
+
+            payload = page.evaluate(
+                """
+                () => {
+                  const body = document.body ? document.body.innerText : '';
+                  const lines = body.split('\n').map(s => s.trim()).filter(Boolean);
+                  const channel = lines.find(x => x && !x.includes('粉丝') && !x.includes('关注') && !x.includes('微博网页版')) || '微博账号';
+                  const items = [];
+                  for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const next = lines[i + 1] || '';
+                    const after = lines[i + 2] || '';
+                    const looksLikeTime = /刚刚|分钟前|小时前|昨天|\d{2}-\d{2}|今天/.test(line);
+                    if (!looksLikeTime) continue;
+                    if (!next || next.includes('来自')) continue;
+                    const text = [line, next, after].filter(Boolean).join('\n');
+                    items.push({ text });
+                    if (items.length >= 10) break;
+                  }
+                  return { channel, items };
+                }
+                """
+            )
+            return {"payload": payload}
+
+        try:
+            result = bridge.with_page(f"https://weibo.com/u/{user_id}", _extract, wait_ms=6000)
+        except ChromeSessionUnavailable as e:
+            self.last_error = f"微博浏览器后备不可用: {e}"
+            return []
+        except Exception as e:
+            self.last_error = f"微博浏览器后备抓取失败: {e}"
+            return []
+
+        if result.get("error") == "captcha":
+            self.last_error = "微博已触发验证，当前需要登录态浏览器才能继续抓取。"
+            return []
+        if result.get("error") == "security_check":
+            self.last_error = "微博页面要求安全验证，当前浏览器态无法继续。"
+            return []
+        if result.get("error") == "login_required":
+            self.last_error = "微博登录后才能读取微博列表，当前匿名态只能看到主页概要。"
+            return []
+
+        payload = result.get("payload") or {}
+        items = []
+        channel_title = (payload or {}).get("channel") or "微博账号"
+        for row in (payload or {}).get("items") or []:
+            text = (row.get("text") or "").strip()
+            if not text:
+                continue
+            title = text.split("\n", 2)[1].strip() if "\n" in text else text[:120]
+            item_id_basis = text[:120]
+            items.append({
+                "item_id": f"weibo_{hashlib.md5(item_id_basis.encode()).hexdigest()[:12]}",
+                "title": title[:120] if title else "微博动态",
+                "description": text[:500],
+                "link": url,
+                "pub_date": "",
+                "metadata": {
+                    "_channel_title": channel_title,
+                    "source": "chrome_session_bridge",
+                }
+            })
+
+        if items:
+            print(f"    ✓ Weibo browser fallback: {len(items)} items")
+            self.last_error = None
+            return items[:10]
+
+        self.last_error = "微博浏览器后备已打开页面，但当前页面没有解析出可用的微博列表。"
+        return []
 
 
 class DouyinScraper(RSSHubScraper):
@@ -534,19 +888,154 @@ class DouyinScraper(RSSHubScraper):
 
         return None
 
+    def fetch_items(self, url: str) -> List[Dict[str, Any]]:
+        items = super().fetch_items(url)
+        if items:
+            return items
+
+        if not self._should_try_browser_fallback(self.last_error or ""):
+            return []
+
+        browser_items = self._fetch_via_browser(url)
+        if browser_items or self.last_error is None:
+            return browser_items
+        return []
+
+    def _fetch_via_browser(self, url: str) -> List[Dict[str, Any]]:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            self.last_error = (
+                "抖音 RSSHub 被风控，且当前没有可用浏览器后备。"
+                "如需继续，请先安装 Playwright 或启用 web-access。"
+            )
+            return []
+
+        resolved_url = self._resolve_share_url(url)
+        if not resolved_url:
+            self.last_error = f"无法解析抖音用户页地址: {url}"
+            return []
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(
+                    user_agent=(
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 "
+                        "Mobile/15E148 Safari/604.1"
+                    )
+                )
+                page.goto(resolved_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                payload = page.evaluate(
+                    """
+                    () => {
+                      const pageData = (((window._ROUTER_DATA || {}).loaderData || {})['user_(id)/page']) || {};
+                      return {
+                        userInfoRes: pageData.userInfoRes || {},
+                        postListData: pageData.postListData || {},
+                      };
+                    }
+                    """
+                )
+                browser.close()
+
+            items = self._parse_douyin_page_payload(payload)
+            if items:
+                self.last_error = None
+                return items
+
+            user_info = ((payload or {}).get("userInfoRes") or {}).get("user_info") or {}
+            if user_info.get("aweme_count") == 0:
+                self.last_error = None
+                return []
+        except Exception as e:
+            self.last_error = f"抖音浏览器后备抓取失败: {e}"
+            return []
+
+        self.last_error = "抖音页面可打开，但当前页面没有返回可解析的作品列表。"
+        return []
+
+    def _resolve_share_url(self, url: str) -> Optional[str]:
+        try:
+            response = httpx.get(url, headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 "
+                    "Mobile/15E148 Safari/604.1"
+                )
+            }, follow_redirects=True, timeout=15)
+        except Exception:
+            return url if "iesdouyin.com/share/user/" in url else None
+
+        final_url = str(response.url)
+        if "iesdouyin.com/share/user/" in final_url:
+            return final_url
+
+        sec_uid_match = re.search(r"sec_uid=([^&]+)", final_url)
+        user_path_match = re.search(r"/share/user/([^/?]+)", final_url)
+        if user_path_match:
+            sec_uid = sec_uid_match.group(1) if sec_uid_match else ""
+            base = f"https://www.iesdouyin.com/share/user/{user_path_match.group(1)}"
+            return f"{base}?sec_uid={urllib.parse.quote(sec_uid)}" if sec_uid else base
+
+        return None
+
+    def _parse_douyin_page_payload(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        user_info_res = (payload or {}).get("userInfoRes") or {}
+        user_info = user_info_res.get("user_info") or {}
+        post_data = (payload or {}).get("postListData") or {}
+
+        aweme_list = (
+            post_data.get("aweme_list")
+            or post_data.get("awemeList")
+            or post_data.get("items")
+            or []
+        )
+        if isinstance(aweme_list, dict):
+            aweme_list = aweme_list.get("list") or []
+
+        channel_title = user_info.get("nickname") or user_info.get("unique_id") or "抖音账号"
+        items = []
+        for aweme in aweme_list[:20]:
+            aweme_id = str(aweme.get("aweme_id") or aweme.get("awemeId") or "")
+            if not aweme_id:
+                continue
+            desc = (aweme.get("desc") or aweme.get("description") or "").strip()
+            title = desc[:120] + "..." if len(desc) > 120 else (desc or f"抖音视频 {aweme_id[-6:]}")
+            create_time = aweme.get("create_time") or aweme.get("createTime") or 0
+            pub_date = ""
+            if create_time:
+                try:
+                    pub_date = datetime.fromtimestamp(int(create_time)).isoformat()
+                except Exception:
+                    pass
+            items.append({
+                "item_id": f"douyin_{hashlib.md5(aweme_id.encode()).hexdigest()[:12]}",
+                "title": title,
+                "description": desc[:500],
+                "link": f"https://www.douyin.com/video/{aweme_id}",
+                "pub_date": pub_date,
+                "metadata": {
+                    "_channel_title": channel_title,
+                    "aweme_id": aweme_id,
+                }
+            })
+        return items
+
 
 class XiaohongshuScraper(BaseScraper):
-    """Xiaohongshu scraper — uses Playwright with rednote-mcp cookies.
+    """Xiaohongshu scraper — browser-first, then Playwright cookies, then RSSHub.
 
-    Strategy: load user profile page in headless browser, intercept the XHR
-    response from the `user_posted` API. The browser handles request signing
-    automatically, bypassing the 406 error from direct API calls.
+    Preferred strategy: use a real browser context to read visible note cards
+    from the profile page. This is more stable than headless cookie injection
+    when XHS tightens captcha / device verification.
 
-    Cookie source: ~/.mcp/rednote/cookies.json (managed by rednote-mcp init)
-    Fallback: RSSHub route (may fail due to XHS anti-scraping)
+    Fallback 1: Playwright + rednote-mcp cookies
+    Fallback 2: RSSHub route (best effort only)
     """
 
-    RSSHUB_BASE = os.environ.get("RSSHUB_BASE_URL", "http://localhost:1200")
     COOKIE_PATH = os.path.expanduser("~/.mcp/rednote/cookies.json")
 
     def __init__(self):
@@ -576,17 +1065,113 @@ class XiaohongshuScraper(BaseScraper):
             self.last_error = f"Cannot extract XHS user ID from {url}"
             return []
 
-        # Try Playwright with rednote-mcp cookies
+        items = self._fetch_via_browser(url, user_id)
+        if items:
+            return items
+        if self.last_error and ("login/captcha wall" in self.last_error or "login_required" in self.last_error):
+            return []
+
+        # Fallback: Playwright with rednote-mcp cookies
         if self._pw_cookies:
             items = self._fetch_via_playwright(user_id)
             if items:
                 return items
+            if self.last_error and "cookies expired" in self.last_error.lower():
+                return []
 
-        # Fallback: RSSHub
+        # Final fallback: RSSHub
         return self._fetch_via_rsshub(user_id)
 
+    def _fetch_via_browser(self, url: str, user_id: str) -> List[Dict[str, Any]]:
+        """Use the user's real Chrome session when available."""
+        print(f"    🌐 XHS browser-first: user={user_id}")
+        bridge = ChromeSessionBridge()
+
+        def _extract(page):
+            body_text = page.locator("body").inner_text()[:5000]
+            final_url = page.url
+            if "captcha" in final_url or "login" in final_url or "登录" in body_text or "扫码" in body_text:
+                return {"error": "login_required"}
+
+            payload = page.evaluate(
+                """
+                () => {
+                  const text = (el) => (el && el.innerText ? el.innerText.trim() : '');
+                  const cards = [];
+                  const nodes = Array.from(document.querySelectorAll('section.note-item, .note-item'));
+                  for (const section of nodes) {
+                    const linkEl = section.querySelector('a.cover, a[href*="/explore/"], a[href*="/user/profile/"]');
+                    const href = linkEl ? (linkEl.getAttribute('href') || '') : '';
+                    if (!href) continue;
+                    const titleEl = section.querySelector('.title span, .title, [class*="title"]');
+                    const raw = text(section);
+                    const title = text(titleEl) || raw.split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+                    cards.push({ href, title, raw });
+                    if (cards.length >= 12) break;
+                  }
+                  const authorEl = document.querySelector('.user-name, .info .username, .user-nickname');
+                  return { author: text(authorEl), cards };
+                }
+                """
+            )
+            return {"payload": payload}
+
+        try:
+            result = bridge.with_page(f"https://www.xiaohongshu.com/user/profile/{user_id}", _extract, wait_ms=7000)
+        except ChromeSessionUnavailable as e:
+            self.last_error = f"XHS browser-first unavailable: {e}"
+            return []
+        except Exception as e:
+            self.last_error = f"XHS browser-first failed: {e}"
+            return []
+
+        if result.get("error") == "login_required":
+            self.last_error = "XHS login_required: browser-first hit login/captcha wall"
+            return []
+
+        payload = result.get("payload") or {}
+        items = []
+        author = (payload or {}).get("author") or "小红书账号"
+        seen_ids = set()
+        for row in (payload or {}).get("cards") or []:
+            href = (row.get("href") or "").strip()
+            title = (row.get("title") or "").strip()
+            raw = (row.get("raw") or "").strip()
+            if not href:
+                continue
+            href = urllib.parse.urljoin("https://www.xiaohongshu.com", href)
+            note_match = re.search(r"/explore/([a-f0-9]+)", href)
+            if not note_match:
+                note_match = re.search(r"/([a-f0-9]{24})(?:\?|$)", href)
+            if not note_match:
+                continue
+            note_id = note_match.group(1)
+            if note_id in seen_ids:
+                continue
+            seen_ids.add(note_id)
+            items.append({
+                "item_id": f"xiaohongshu_{hashlib.md5(note_id.encode()).hexdigest()[:12]}",
+                "title": title or "(无标题)",
+                "description": raw[:500],
+                "link": f"https://www.xiaohongshu.com/explore/{note_id}",
+                "pub_date": "",
+                "metadata": {
+                    "_channel_title": author,
+                    "note_id": note_id,
+                    "source": "chrome_session_bridge",
+                }
+            })
+
+        if items:
+            print(f"    ✓ XHS browser-first: {len(items)} notes")
+            self.last_error = None
+            return items[:10]
+
+        self.last_error = "XHS browser-first opened page but found no note cards"
+        return []
+
     def _fetch_via_playwright(self, user_id: str) -> List[Dict[str, Any]]:
-        """Fetch user notes by intercepting XHR in a headless browser."""
+        """Fetch user notes by intercepting XHR in a browser context with cookies."""
         print(f"    📡 XHS Playwright: user={user_id}")
         captured_notes = []
 
@@ -625,6 +1210,12 @@ class XiaohongshuScraper(BaseScraper):
                     print("    ⚠️  XHS cookies expired (captcha/login redirect)")
                     print("    💡 Fix: run 'npx rednote-mcp init' to re-login")
                     self.last_error = "XHS cookies expired — run 'npx rednote-mcp init'"
+                    notify_macos(
+                        title="Let's Go RSS",
+                        subtitle="XHS cookies expired",
+                        message="Run: npx rednote-mcp init",
+                        dedupe_key="xhs_cookies_expired",
+                    )
                     browser.close()
                     return []
 
@@ -783,10 +1374,17 @@ class XiaohongshuScraper(BaseScraper):
 
     def _fetch_via_rsshub(self, user_id: str) -> List[Dict[str, Any]]:
         """Fallback: fetch via RSSHub (may fail due to XHS anti-scraping)."""
-        rsshub_url = f"{self.RSSHUB_BASE}/xiaohongshu/user/{user_id}/notes"
-        print(f"    📡 RSSHub fallback: {rsshub_url}")
+        route = f"/xiaohongshu/user/{user_id}/notes"
+        print(f"    📡 RSSHub fallback: {route}")
         try:
-            response = self.get(rsshub_url, timeout=6, retries=1)
+            # Keep a tight budget for the fallback; rsshub_client handles
+            # base rotation, this scraper's `get` honors timeout/retries.
+            orig_to, orig_r = self.timeout, self.max_retries
+            self.timeout, self.max_retries = 6, 1
+            try:
+                response = rsshub_client.fetch(route, self)
+            finally:
+                self.timeout, self.max_retries = orig_to, orig_r
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 parser = NativeRSSScraper()
@@ -812,7 +1410,6 @@ class TwitterScraper(BaseScraper):
     """
 
     SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
-    RSSHUB_BASE = os.environ.get("RSSHUB_BASE_URL", "http://localhost:1200")
 
     def extract_user_id(self, url: str) -> Optional[str]:
         """Extract username from x.com or twitter.com URL."""
@@ -937,10 +1534,15 @@ class TwitterScraper(BaseScraper):
 
     def _fetch_via_rsshub(self, username: str) -> List[Dict[str, Any]]:
         """Fallback: fetch via RSSHub (requires TWITTER_AUTH_TOKEN)."""
-        rsshub_url = f"{self.RSSHUB_BASE}/twitter/user/{username}"
-        print(f"    📡 RSSHub fallback: {rsshub_url}")
+        route = f"/twitter/user/{username}"
+        print(f"    📡 RSSHub fallback: {route}")
         try:
-            response = self.get(rsshub_url, timeout=10)
+            orig_to = self.timeout
+            self.timeout = 10
+            try:
+                response = rsshub_client.fetch(route, self)
+            finally:
+                self.timeout = orig_to
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 parser = NativeRSSScraper()
@@ -966,7 +1568,6 @@ class ZsxqScraper(BaseScraper):
     """
 
     PUB_API = "https://pub-api.zsxq.com/v2/groups/{group_id}"
-    RSSHUB_BASE = os.environ.get("RSSHUB_BASE_URL", "http://localhost:1200")
 
     def extract_user_id(self, url: str) -> Optional[str]:
         """Extract group_id from various zsxq URL formats."""
@@ -1116,10 +1717,15 @@ class ZsxqScraper(BaseScraper):
 
     def _fetch_via_rsshub(self, group_id: str) -> List[Dict[str, Any]]:
         """Fallback: fetch via RSSHub (requires ZSXQ_ACCESS_TOKEN)."""
-        rsshub_url = f"{self.RSSHUB_BASE}/zsxq/group/{group_id}"
-        print(f"    📡 RSSHub fallback: {rsshub_url}")
+        route = f"/zsxq/group/{group_id}"
+        print(f"    📡 RSSHub fallback: {route}")
         try:
-            response = self.get(rsshub_url, timeout=10)
+            orig_to = self.timeout
+            self.timeout = 10
+            try:
+                response = rsshub_client.fetch(route, self)
+            finally:
+                self.timeout = orig_to
             ct = response.headers.get("content-type", "")
             if "xml" in ct or "rss" in ct:
                 parser = NativeRSSScraper()

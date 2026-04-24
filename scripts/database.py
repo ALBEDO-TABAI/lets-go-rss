@@ -37,7 +37,7 @@ class RSSDatabase:
         raise last_err
 
     def init_database(self):
-        """Initialize database schema"""
+        """Initialize database schema + idempotent migrations."""
         with self._connect() as conn:
             cursor = conn.cursor()
 
@@ -77,6 +77,63 @@ class RSSDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_subscription_id ON items(subscription_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_category ON items(category)")
 
+            # --- Migrations (idempotent) ---
+            self._migrate_subscriptions(cursor)
+
+            conn.commit()
+
+    @staticmethod
+    def _column_names(cursor, table: str) -> set:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cursor.fetchall()}
+
+    def _migrate_subscriptions(self, cursor) -> None:
+        cols = self._column_names(cursor, "subscriptions")
+        if "consecutive_failures" not in cols:
+            cursor.execute(
+                "ALTER TABLE subscriptions ADD COLUMN consecutive_failures INTEGER DEFAULT 0"
+            )
+        if "last_error" not in cols:
+            cursor.execute(
+                "ALTER TABLE subscriptions ADD COLUMN last_error TEXT"
+            )
+        if "last_error_kind" not in cols:
+            cursor.execute(
+                "ALTER TABLE subscriptions ADD COLUMN last_error_kind TEXT"
+            )
+        if "last_success_at" not in cols:
+            cursor.execute(
+                "ALTER TABLE subscriptions ADD COLUMN last_success_at TIMESTAMP"
+            )
+
+    def record_fetch_outcome(self, subscription_id: int, *,
+                             success: bool, error: Optional[str] = None,
+                             error_kind: Optional[str] = None) -> None:
+        """Update a subscription's health signals after a fetch attempt.
+
+        - On success: clear consecutive_failures, clear last_error, bump
+          last_success_at.
+        - On failure: increment consecutive_failures, record error + kind.
+        """
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            if success:
+                cur.execute(
+                    "UPDATE subscriptions "
+                    "SET consecutive_failures=0, last_error=NULL, last_error_kind=NULL, "
+                    "    last_success_at=?, last_updated=? "
+                    "WHERE id=?",
+                    (now, now, subscription_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE subscriptions "
+                    "SET consecutive_failures=COALESCE(consecutive_failures, 0) + 1, "
+                    "    last_error=?, last_error_kind=?, last_updated=? "
+                    "WHERE id=?",
+                    (error, error_kind, now, subscription_id),
+                )
             conn.commit()
 
     def add_subscription(self, url: str, platform: str, title: str = "", description: str = "") -> int:

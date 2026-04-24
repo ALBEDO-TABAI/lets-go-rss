@@ -16,6 +16,22 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Node (skill-owned RSSHub install)
+node_modules/
+package-lock.json
+package.json
+
+# RSSHub worker runtime state
+assets/.rsshub.pid
+assets/.rsshub.log
+assets/.last_run_health.json
+
+# OpenClaw push runtime logs
+logs/
+
+# Environment overrides
+.env
+
 # OS
 .DS_Store
 assets/last_digest.json

@@ -32,14 +32,14 @@ class MarkdownReportGenerator:
         """Generate latest update report.
         
         Args:
-            digest: If True, show only the latest 1 item per subscription.
+            digest: If True, generate delta-only report (changed accounts only).
                     If no new items, output a single-line "无更新".
         """
 
         if not new_items:
             content = self._generate_empty_report()
         elif digest:
-            content = self._generate_digest_report(new_items, output_dir=os.path.dirname(output_path) or ".")
+            content = self._generate_delta_report(new_items, output_dir=os.path.dirname(output_path) or ".")
         else:
             content = self._generate_full_report(new_items)
 
@@ -48,19 +48,28 @@ class MarkdownReportGenerator:
 
         return output_path
 
-    def _generate_digest_report(self, new_items: List[Dict[str, Any]],
-                                output_dir: str = ".") -> str:
-        """Generate digest report — all accounts shown, changed ones marked 🆕.
+    def generate_full_overview(self, all_items: List[Dict[str, Any]],
+                               output_path: str = "full_overview.md") -> str:
+        """Generate full overview report — all accounts, latest 1 item each.
+        
+        This file is for querying (--overview), NOT for push notifications.
+        """
+        content = self._generate_overview_report(all_items)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return output_path
 
-        Output is PLAIN TEXT (no markdown links/bold) for maximum compatibility
-        with platforms like Feishu, WeChat, Discord etc.
+    def _build_snapshot(self, items: List[Dict[str, Any]], output_dir: str) -> tuple:
+        """Build current snapshot and load previous one for comparison.
+        
+        Returns: (by_account, changed_keys, current_snapshot)
         """
         import json
         from collections import OrderedDict
 
         # Group by subscription_url (= per account), keep newest
         by_account = OrderedDict()
-        for item in new_items:
+        for item in items:
             key = item.get("subscription_url", item.get("platform", "unknown"))
             if key not in by_account:
                 by_account[key] = item
@@ -87,52 +96,84 @@ class MarkdownReportGenerator:
         with open(snapshot_path, "w", encoding="utf-8") as f:
             json.dump(current_snapshot, f, ensure_ascii=False)
 
+        return by_account, changed_keys, current_snapshot
+
+    def _format_account_line(self, item: Dict[str, Any], tag: str = "") -> List[str]:
+        """Format a single account entry for reports."""
+        platform = item.get("platform", "").lower()
+        emoji = self.platform_emojis.get(platform, "🔗")
+        title = item.get("title", "Untitled")
+        link = item.get("link", "")
+        sub_title = item.get("subscription_title", "")
+        account = sub_title if sub_title and "Subscription" not in sub_title else ""
+        name = account or platform.title()
+
+        # Format pub_date if available
+        pub_date_str = ""
+        raw_date = item.get("pub_date", "")
+        if raw_date:
+            try:
+                from dateutil import parser as dateparser
+                dt = dateparser.parse(raw_date)
+                pub_date_str = dt.strftime("%m-%d %H:%M")
+            except Exception:
+                pub_date_str = raw_date[:10] if len(raw_date) >= 10 else ""
+
+        date_suffix = f"  {pub_date_str}" if pub_date_str else ""
+        lines = [f"{tag}{emoji} {name}{date_suffix}"]
+
+        if link:
+            lines.append(f"   [{title}]({link})")
+        else:
+            lines.append(f"   {title}")
+        lines.append("")
+        return lines
+
+    def _generate_delta_report(self, items: List[Dict[str, Any]],
+                               output_dir: str = ".") -> str:
+        """Generate delta-only report — ONLY accounts with new content.
+
+        This is the file used for push notifications (Feishu, etc.).
+        Only changed accounts appear; unchanged accounts are omitted.
+        """
+        by_account, changed_keys, _ = self._build_snapshot(items, output_dir)
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         new_count = len(changed_keys)
 
-        if new_count:
-            header = f"📡 RSS 更新摘要 | {now} | {new_count} 个账号有新内容"
-        else:
-            header = f"📡 RSS 更新摘要 | {now} | 暂无新更新"
+        if not new_count:
+            return "这会rss么的更新"
 
+        header = f"白，rss有更新了！\n\n📡 RSS 增量更新 | {now} | {new_count} 个账号有新内容"
         lines = [header, ""]
 
-        # Show ALL accounts
+        # Show ONLY changed accounts
         for sub_url, item in by_account.items():
-            platform = item.get("platform", "").lower()
-            emoji = self.platform_emojis.get(platform, "🔗")
-            title = item.get("title", "Untitled")
-            link = item.get("link", "")
-            sub_title = item.get("subscription_title", "")
-            account = sub_title if sub_title and "Subscription" not in sub_title else ""
-            is_new = sub_url in changed_keys
+            if sub_url in changed_keys:
+                lines.extend(self._format_account_line(item, tag="🆕 "))
 
-            # Single-line: tag + emoji + account + pub_date
-            tag = "🆕 " if is_new else ""
-            name = account or platform.title()
+        return "\n".join(lines)
 
-            # Format pub_date if available
-            pub_date_str = ""
-            raw_date = item.get("pub_date", "")
-            if raw_date:
-                try:
-                    from dateutil import parser as dateparser
-                    dt = dateparser.parse(raw_date)
-                    pub_date_str = dt.strftime("%m-%d %H:%M")
-                except Exception:
-                    # fallback: try to extract date portion
-                    pub_date_str = raw_date[:10] if len(raw_date) >= 10 else ""
+    def _generate_overview_report(self, items: List[Dict[str, Any]]) -> str:
+        """Generate full overview report — ALL accounts, no change markers.
 
-            date_suffix = f"  {pub_date_str}" if pub_date_str else ""
-            lines.append(f"{tag}{emoji} {name}{date_suffix}")
+        This file is for user queries (--overview), not for push.
+        """
+        from collections import OrderedDict
 
-            # Title as clickable hyperlink
-            if link:
-                lines.append(f"   [{title}]({link})")
-            else:
-                lines.append(f"   {title}")
+        by_account = OrderedDict()
+        for item in items:
+            key = item.get("subscription_url", item.get("platform", "unknown"))
+            if key not in by_account:
+                by_account[key] = item
 
-            lines.append("")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        total = len(by_account)
+        header = f"📡 RSS 全量概览 | {now} | {total} 个订阅"
+        lines = [header, ""]
+
+        for sub_url, item in by_account.items():
+            lines.extend(self._format_account_line(item))
 
         return "\n".join(lines)
 
@@ -280,6 +321,96 @@ class MarkdownReportGenerator:
 
         return lines
 
+    def _build_health_section(self, subscriptions: List[Dict[str, Any]],
+                               out_dir: str) -> List[str]:
+        """Build the 🩺 health section: current-run status + stale sources."""
+        import json
+
+        # Load last run health if present
+        run_health = None
+        health_path = os.path.join(out_dir, ".last_run_health.json")
+        try:
+            with open(health_path, "r", encoding="utf-8") as f:
+                run_health = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        # Compute staleness from last_success_at (preferred) or last_updated.
+        # last_success_at only advances on actual success, so it accurately
+        # flags sources that have been failing for a while.
+        stale_threshold_days = 3
+        now = datetime.now()
+        stale_rows = []  # (days_since, sub)
+        for sub in subscriptions:
+            signal = sub.get("last_success_at") or sub.get("last_updated")
+            if not signal:
+                stale_rows.append((None, sub))
+                continue
+            try:
+                dt = datetime.fromisoformat(str(signal).replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    dt = dt.replace(tzinfo=None)
+                days = (now - dt).days
+                if days >= stale_threshold_days:
+                    stale_rows.append((days, sub))
+            except Exception:
+                stale_rows.append((None, sub))
+
+        # Nothing to show
+        if not run_health and not stale_rows:
+            return []
+
+        out = ["## 🩺 健康度", ""]
+
+        if run_health:
+            per_source = run_health.get("per_source", {})
+            total = len(per_source)
+            ok = sum(1 for s in per_source.values() if s.get("status") == "ok")
+            no_new = sum(1 for s in per_source.values() if s.get("status") == "no_new")
+            errors = sum(1 for s in per_source.values() if s.get("status") == "error")
+            elapsed = run_health.get("elapsed_sec", "?")
+            new_count = run_health.get("total_new", 0)
+            out.append(
+                f"**本次运行** (耗时 {elapsed}s)"
+                f":✅ {ok} 正常 / → {no_new} 无新增 / ❌ {errors} 失败"
+                f"  (共 {total} 源,本轮新增 {new_count} 条)"
+            )
+            out.append("")
+
+            failed = [
+                (url, info) for url, info in per_source.items()
+                if info.get("status") == "error"
+            ]
+            if failed:
+                out.append("**失败源**:")
+                out.append("")
+                for url, info in failed:
+                    platform = info.get("platform", "").lower()
+                    emoji = self.platform_emojis.get(platform, "🔗")
+                    name = info.get("title") or platform.title()
+                    err_short = (info.get("error") or "").split("\n")[0][:120]
+                    out.append(f"- {emoji} **{name}** — {err_short}")
+                    out.append(f"  `{url}`")
+                out.append("")
+
+        # Stale sources (>= 3 days)
+        if stale_rows:
+            # Sort: longest stale first; "None" (never updated) at the bottom
+            stale_rows.sort(key=lambda x: (x[0] is None, -(x[0] or 0)))
+            out.append(f"**陈旧源** (超过 {stale_threshold_days} 天未成功更新):")
+            out.append("")
+            for days, sub in stale_rows:
+                platform = (sub.get("platform") or "").lower()
+                emoji = self.platform_emojis.get(platform, "🔗")
+                name = sub.get("title") or platform.title()
+                age_str = "从未更新" if days is None else f"{days} 天前"
+                out.append(f"- {emoji} **{name}** — 上次成功: {age_str}")
+            out.append("")
+
+        out.append("---")
+        out.append("")
+        return out
+
     def generate_summary_report(self, db, output_path: str = "summary.md") -> str:
         """Generate overall summary report"""
 
@@ -292,6 +423,13 @@ class MarkdownReportGenerator:
             f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
         ]
+
+        # Health section (🩺) — reads .last_run_health.json from same dir
+        health_lines = self._build_health_section(
+            subscriptions, os.path.dirname(output_path) or "."
+        )
+        if health_lines:
+            lines.extend(health_lines)
 
         # Subscription statistics
         lines.append("## 订阅统计")

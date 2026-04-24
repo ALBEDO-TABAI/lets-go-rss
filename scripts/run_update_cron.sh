@@ -12,7 +12,7 @@ export RSS_HTTP_TIMEOUT="${RSS_HTTP_TIMEOUT:-10}"
 export RSS_HTTP_RETRIES="${RSS_HTTP_RETRIES:-2}"
 export RSS_XHS_TIMEOUT="${RSS_XHS_TIMEOUT:-6}"
 export RSS_XHS_RETRIES="${RSS_XHS_RETRIES:-1}"
-export RSS_YTDLP_TIMEOUT="${RSS_YTDLP_TIMEOUT:-30}"
+export RSS_YTDLP_TIMEOUT="${RSS_YTDLP_TIMEOUT:-45}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -76,10 +76,23 @@ if [[ -z "${SELECTED_PYTHON}" ]]; then
   echo "   - /opt/homebrew/bin/python3 scripts/setup.py"
   echo "   - python3 scripts/setup.py"
   rc=1
-elif "${SELECTED_PYTHON}" scripts/lets_go_rss.py --update --no-llm --digest --skip-setup; then
-  rc=0
 else
-  rc=$?
+  # Preflight: ensure our managed RSSHub (:1201) is healthy.
+  # Never blocks cron — `start-if-needed` caps itself at ~10s.
+  "${SELECTED_PYTHON}" scripts/rsshub_manager.py start-if-needed >/dev/null 2>&1 || true
+
+  # Weekly rsshub upgrade (Mon 06:xx UTC-aware local "Mon 06:55" window).
+  # Runs in background so it does not slow down the main update run.
+  if [[ "$(date '+%u-%H')" == "1-06" ]]; then
+    echo "[cron] weekly rsshub upgrade (background)"
+    ("${SELECTED_PYTHON}" scripts/rsshub_manager.py update >> /tmp/rsshub_upgrade.log 2>&1 &)
+  fi
+
+  if "${SELECTED_PYTHON}" scripts/lets_go_rss.py --update --digest --skip-setup; then
+    rc=0
+  else
+    rc=$?
+  fi
 fi
 echo "===== [$(date '+%Y-%m-%d %H:%M:%S %z')] run_update_cron end rc=${rc} ====="
 exit "${rc}"

@@ -20,6 +20,23 @@ from rss_generator import RSSGenerator, OPMLGenerator
 from report_generator import MarkdownReportGenerator
 
 
+def classify_fetch_error(err: str) -> str:
+    """Bucket a free-form scraper error into a short kind tag used for health
+    tracking and adaptive retry decisions."""
+    e = (err or "").lower()
+    if "cookies expired" in e or "api key" in e or "401" in e or "403" in e:
+        return "auth"
+    if "429" in e or "too many requests" in e or "rate limit" in e:
+        return "rate_limit"
+    if "connection refused" in e or "errno 61" in e or "timeout" in e or "timed out" in e:
+        return "network"
+    if "503" in e or "service unavailable" in e or "风控" in e or "captcha" in e or "waf" in e:
+        return "upstream_block"
+    if "non-rss" in e or "parse" in e or "json" in e:
+        return "parse"
+    return "other"
+
+
 @contextmanager
 def update_lock(lock_path: str):
     """Ensure only one update job runs at a time."""
@@ -136,7 +153,8 @@ class RSSEngine:
             for sub in subscriptions:
                 future = executor.submit(
                     self._fetch_subscription,
-                    sub["id"], sub["url"], sub["platform"], use_classification
+                    sub["id"], sub["url"], sub["platform"], use_classification,
+                    int(sub.get("consecutive_failures") or 0),
                 )
                 future_to_sub[future] = sub
 
@@ -153,7 +171,7 @@ class RSSEngine:
                     else:
                         results[sub["id"]] = (0, None)
                         print(f"  → {platform}: no new items")
-                    self.db.update_subscription_timestamp(sub["id"])
+                    self.db.record_fetch_outcome(sub["id"], success=True)
                 except Exception as e:
                     err_msg = str(e)
                     results[sub["id"]] = (0, err_msg)
@@ -163,6 +181,10 @@ class RSSEngine:
                         "url": sub["url"],
                         "error": err_msg,
                     })
+                    self.db.record_fetch_outcome(
+                        sub["id"], success=False,
+                        error=err_msg, error_kind=classify_fetch_error(err_msg),
+                    )
 
         elapsed = time.time() - t0
         total_new = sum(r[0] for r in results.values())
@@ -179,6 +201,31 @@ class RSSEngine:
 
         # Output directory = same dir as database (assets/)
         out_dir = os.path.dirname(self.db.db_path) or "."
+
+        # Persist per-source run health so summary.md can surface it.
+        try:
+            import json as _json
+            per_source = {}
+            for sub in subscriptions:
+                count, err = results.get(sub["id"], (0, None))
+                per_source[sub["url"]] = {
+                    "platform": sub["platform"],
+                    "title": sub.get("title") or sub["platform"].title(),
+                    "status": "error" if err else ("ok" if count else "no_new"),
+                    "error": err,
+                    "new_count": count,
+                }
+            health_path = os.path.join(out_dir, ".last_run_health.json")
+            with open(health_path, "w", encoding="utf-8") as f:
+                _json.dump({
+                    "generated_at": ended_at.isoformat(),
+                    "elapsed_sec": round(elapsed, 1),
+                    "total_new": total_new,
+                    "errors": errors,
+                    "per_source": per_source,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as _e:
+            print(f"  ⚠️  Failed to write run health: {_e}")
 
         # Generate RSS feeds
         print("📝 Generating outputs...")
@@ -197,7 +244,11 @@ class RSSEngine:
             # Full mode: show only items fetched in this update cycle
             report_items = self.db.get_new_items_since(update_start)
         self.report_generator.generate_update_report(report_items, os.path.join(out_dir, "latest_update.md"), digest=digest)
-        print("✓ latest_update.md")
+        print("✓ latest_update.md (增量)")
+
+        if digest:
+            self.report_generator.generate_full_overview(report_items, os.path.join(out_dir, "full_overview.md"))
+            print("✓ full_overview.md (全量)")
 
         self.report_generator.generate_summary_report(self.db, os.path.join(out_dir, "summary.md"))
         print("✓ summary.md")
@@ -209,13 +260,19 @@ class RSSEngine:
         }
 
     def _fetch_subscription(self, subscription_id: int, url: str, platform: str,
-                           use_classification: bool = True) -> List[Dict[str, Any]]:
+                           use_classification: bool = True,
+                           consecutive_failures: int = 0) -> List[Dict[str, Any]]:
         """Fetch content from a subscription"""
 
         # Get scraper
         scraper = self.scraper_factory.get_scraper(platform)
         if not scraper:
             raise ValueError(f"No scraper available for platform: {platform}")
+
+        # Adaptive budget: sources that have been failing repeatedly get a
+        # tight timeout + no retry, so a single bad source can't blow up the
+        # overall run time. BaseScraper.get honors this attribute.
+        scraper._adaptive_health_hint = consecutive_failures
 
         # Fetch items
         items = scraper.fetch_items(url)
@@ -253,17 +310,15 @@ class RSSEngine:
             # INSERT OR IGNORE in add_item() still protects against race conditions.
             if self.db.item_exists(item_id):
                 continue
-            item["category"] = "其他"
 
             if use_classification:
-                try:
-                    category = self.classifier.classify_item(
-                        item.get("title", ""),
-                        item.get("description", "")
-                    )
-                    item["category"] = category
-                except Exception as e:
-                    print(f"  ⚠️  Classification error: {e}")
+                # classify_item never raises — it has a keyword fallback internally
+                item["category"] = self.classifier.classify_item(
+                    item.get("title", ""),
+                    item.get("description", ""),
+                )
+            else:
+                item["category"] = "其他"
 
             # Atomic insert — INSERT OR IGNORE handles dedup
             added = self.db.add_item(
@@ -352,12 +407,13 @@ Examples:
     parser.add_argument("--stats", action="store_true", help="Show statistics")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM classification")
     parser.add_argument("--digest", action="store_true", help="Digest mode: show only latest 1 item per account")
+    parser.add_argument("--overview", action="store_true", help="Print full overview (all accounts, latest item each)")
     parser.add_argument("--db", default="rss_database.db", help="Database path (default: rss_database.db)")
 
     args = parser.parse_args()
 
     # Check if any action specified
-    if not any([args.add, args.update, args.status, args.list, args.stats]):
+    if not any([args.add, args.update, args.status, args.list, args.stats, args.overview]):
         parser.print_help()
         return
 
@@ -369,6 +425,16 @@ Examples:
                 print(f.read())
         else:
             print("⚠️ 尚无缓存报告。请先运行 --update 生成。")
+        return
+
+    # --overview is also a fast path: read full_overview.md
+    if args.overview:
+        overview_path = os.path.join(os.path.dirname(db_path or args.db) or ".", "full_overview.md")
+        if os.path.exists(overview_path):
+            with open(overview_path, "r", encoding="utf-8") as f:
+                print(f.read())
+        else:
+            print("⚠️ 尚无全量概览。请先运行 --update --digest 生成。")
         return
 
     # Initialize engine
