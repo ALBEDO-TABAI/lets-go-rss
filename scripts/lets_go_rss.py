@@ -68,20 +68,6 @@ def run_doctor(auto_fix: bool = False) -> int:
     for name in ("python3", "node", "npx", "yt-dlp"):
         where = shutil.which(name)
         print(f"- {name}: {where or '❌ MISSING'}")
-    # autocli is optional — missing is not an error, just a note
-    autocli_path = shutil.which("autocli")
-    if autocli_path:
-        print(f"- autocli: {autocli_path} ✅")
-    else:
-        print("- autocli: ⚠️  not installed (optional — enables Bilibili/XHS/Twitter via real Chrome)")
-
-    # AutoCLI whitelist
-    platforms = os.environ.get("RSS_AUTOCLI_PLATFORMS", "").strip()
-    if platforms:
-        print(f"- RSS_AUTOCLI_PLATFORMS: {platforms}")
-    elif autocli_path:
-        print("- RSS_AUTOCLI_PLATFORMS: (unset — autocli installed but not routed; "
-              "set to e.g. 'bilibili,xiaohongshu,twitter' in .env)")
     try:
         import httpx  # noqa: F401
         print("- httpx (py): OK")

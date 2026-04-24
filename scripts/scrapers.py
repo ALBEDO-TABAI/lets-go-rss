@@ -1741,53 +1741,6 @@ class ZsxqScraper(BaseScraper):
 
 # ============================================================
 
-def _wrap_with_autocli(scraper: "BaseScraper", platform: str) -> "BaseScraper":
-    """Wrap a scraper so that, when RSS_AUTOCLI_PLATFORMS enables this
-    platform, we try autocli first and fall back to the original scraper on
-    error / empty result. No-op if autocli is not installed or the platform
-    is not whitelisted — the original scraper is returned unchanged."""
-    try:
-        import autocli_adapter as _ac
-    except ImportError:
-        return scraper
-    if not _ac.is_platform_enabled(platform):
-        return scraper
-
-    fetchers = {
-        "bilibili": _ac.fetch_bilibili_user,
-        "xiaohongshu": _ac.fetch_xhs_user,
-        "twitter": _ac.fetch_twitter_user,
-    }
-    autocli_fetch = fetchers.get(platform)
-    if autocli_fetch is None:
-        return scraper
-
-    legacy_fetch_items = scraper.fetch_items
-
-    def _wrapped(url: str) -> List[Dict[str, Any]]:
-        try:
-            user_id = scraper.extract_user_id(url)
-        except Exception:
-            user_id = None
-        if not user_id:
-            return legacy_fetch_items(url)
-        print(f"    🤖 autocli: {platform} user={user_id}")
-        try:
-            items = autocli_fetch(str(user_id))
-        except Exception as e:
-            print(f"    ⚠️  autocli failed ({e}); falling back")
-            scraper.last_error = None  # clear before fallback
-            return legacy_fetch_items(url)
-        if items:
-            scraper.last_error = None
-            return items
-        # Empty result → let legacy have a chance (route may be stale)
-        return legacy_fetch_items(url)
-
-    scraper.fetch_items = _wrapped  # type: ignore[assignment]
-    return scraper
-
-
 class ScraperFactory:
     """Factory to get appropriate scraper for a platform"""
 
@@ -1833,7 +1786,4 @@ class ScraperFactory:
         }
 
         scraper_class = scrapers.get(platform.lower())
-        if not scraper_class:
-            return None
-        instance = scraper_class()
-        return _wrap_with_autocli(instance, platform.lower())
+        return scraper_class() if scraper_class else None
