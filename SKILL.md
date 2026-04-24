@@ -43,6 +43,22 @@ python3 scripts/lets_go_rss.py --doctor      # 只打印状态
 python3 scripts/lets_go_rss.py --auto-fix    # 自动重启挂掉的 RSSHub、清僵尸锁
 ```
 
+### Playwright tier(绕过平台反爬)
+
+`RSS_PLAYWRIGHT_PLATFORMS` 控制哪些平台走 skill 自管的 Chromium(Playwright)—— 用真浏览器访问,继承"正常用户"反爬声誉。
+
+**默认已为 Bilibili 开启**(B 站无需登录,直接工作)。Twitter / 小红书平台强制要求登录态,需要一次性 `--login`:
+
+```bash
+# 一次性登录(打开可见 Chromium,登录后关闭窗口,cookies 永久保存到
+# ~/.lets-go-rss/browser-profile/)
+python3 scripts/lets_go_rss.py --login twitter
+python3 scripts/lets_go_rss.py --login xiaohongshu
+
+# 然后在 .env 里改成
+# RSS_PLAYWRIGHT_PLATFORMS=bilibili,twitter,xiaohongshu
+```
+
 ## Bot 推送最佳实践
 
 **问题**：`--update` 需要 30-60 秒抓取全部订阅，Bot 定时任务可能超时。

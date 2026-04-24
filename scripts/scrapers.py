@@ -1741,6 +1741,54 @@ class ZsxqScraper(BaseScraper):
 
 # ============================================================
 
+def _wrap_with_playwright(scraper: "BaseScraper", platform: str) -> "BaseScraper":
+    """Wrap a scraper so that, when RSS_PLAYWRIGHT_PLATFORMS enables this
+    platform, we try our skill-owned Playwright Chromium first and fall
+    back to the legacy scraper (RSSHub / Chrome CDP / etc.) on error or
+    empty result. No-op if playwright is missing or the platform is not
+    whitelisted — the original scraper is returned unchanged.
+    """
+    try:
+        import playwright_adapter as _pw
+    except ImportError:
+        return scraper
+    if not _pw.is_platform_enabled(platform):
+        return scraper
+
+    fetchers = {
+        "bilibili": _pw.fetch_bilibili_user,
+        "xiaohongshu": _pw.fetch_xhs_user,
+        "twitter": _pw.fetch_twitter_user,
+    }
+    pw_fetch = fetchers.get(platform)
+    if pw_fetch is None:
+        return scraper
+
+    legacy_fetch_items = scraper.fetch_items
+
+    def _wrapped(url: str) -> List[Dict[str, Any]]:
+        try:
+            user_id = scraper.extract_user_id(url)
+        except Exception:
+            user_id = None
+        if not user_id:
+            return legacy_fetch_items(url)
+        print(f"    🎭 playwright: {platform} user={user_id}")
+        try:
+            items = pw_fetch(str(user_id))
+        except Exception as e:
+            print(f"    ⚠️  playwright failed ({e}); falling back")
+            scraper.last_error = None
+            return legacy_fetch_items(url)
+        if items:
+            scraper.last_error = None
+            return items
+        return legacy_fetch_items(url)
+
+    scraper.fetch_items = _wrapped  # type: ignore[assignment]
+    return scraper
+
+
 class ScraperFactory:
     """Factory to get appropriate scraper for a platform"""
 
@@ -1786,4 +1834,7 @@ class ScraperFactory:
         }
 
         scraper_class = scrapers.get(platform.lower())
-        return scraper_class() if scraper_class else None
+        if not scraper_class:
+            return None
+        instance = scraper_class()
+        return _wrap_with_playwright(instance, platform.lower())

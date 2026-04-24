@@ -13,6 +13,10 @@ export RSS_HTTP_RETRIES="${RSS_HTTP_RETRIES:-2}"
 export RSS_XHS_TIMEOUT="${RSS_XHS_TIMEOUT:-6}"
 export RSS_XHS_RETRIES="${RSS_XHS_RETRIES:-1}"
 export RSS_YTDLP_TIMEOUT="${RSS_YTDLP_TIMEOUT:-45}"
+# Bilibili via our skill-owned Playwright Chromium (zero-login, bypasses
+# RSSHub 风控). Twitter/XHS need `--login <platform>` once to opt in; users
+# can extend this var in .env if they have logged in.
+export RSS_PLAYWRIGHT_PLATFORMS="${RSS_PLAYWRIGHT_PLATFORMS:-bilibili}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 

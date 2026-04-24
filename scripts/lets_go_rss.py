@@ -132,6 +132,27 @@ def run_doctor(auto_fix: bool = False) -> int:
     else:
         print(f"- ❌ {xhs_cookie} not present — run `npx rednote-mcp init`")
 
+    # Playwright managed browser
+    print("\n## Playwright (skill-managed Chromium)")
+    try:
+        import playwright  # noqa: F401
+        print("- playwright (py): OK")
+    except Exception:
+        print("- playwright (py): ❌ not installed — `pip install playwright && python -m playwright install chromium`")
+    pw_platforms = os.environ.get("RSS_PLAYWRIGHT_PLATFORMS", "").strip()
+    print(f"- RSS_PLAYWRIGHT_PLATFORMS: {pw_platforms or '(unset — Playwright tier disabled)'}")
+    pw_profile = Path(os.environ.get(
+        "RSS_PLAYWRIGHT_PROFILE",
+        str(Path.home() / ".lets-go-rss" / "browser-profile"),
+    ))
+    if pw_profile.exists():
+        cookies_sqlite = pw_profile / "Default" / "Network" / "Cookies"
+        size = cookies_sqlite.stat().st_size if cookies_sqlite.exists() else 0
+        print(f"- profile: {pw_profile} (cookies db {size} B)")
+    else:
+        print(f"- profile: {pw_profile} (not yet initialised)")
+    print("  login commands: `python scripts/lets_go_rss.py --login {twitter,xiaohongshu}`")
+
     # Auto-fix pass
     if auto_fix:
         print("\n## Auto-fix")
@@ -183,6 +204,18 @@ def main():
     # Fast path: --doctor / --auto-fix — diagnostics, no scraping.
     if "--doctor" in sys.argv or "--auto-fix" in sys.argv:
         sys.exit(run_doctor(auto_fix=("--auto-fix" in sys.argv)))
+
+    # Fast path: --login <platform> — opens a visible Chromium for one-time
+    # sign-in, persists cookies in our profile.
+    if "--login" in sys.argv:
+        idx = sys.argv.index("--login")
+        platform = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        if not platform or platform.startswith("-"):
+            print("Usage: python scripts/lets_go_rss.py --login <twitter|xiaohongshu|bilibili>")
+            sys.exit(2)
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from playwright_adapter import login_platform
+        sys.exit(login_platform(platform))
 
     # Skip setup for --skip-setup (cron jobs)
     skip_setup = '--skip-setup' in sys.argv
