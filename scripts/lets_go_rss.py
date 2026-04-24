@@ -205,8 +205,10 @@ def main():
     if "--doctor" in sys.argv or "--auto-fix" in sys.argv:
         sys.exit(run_doctor(auto_fix=("--auto-fix" in sys.argv)))
 
-    # Fast path: --login <platform> — opens a visible Chromium for one-time
-    # sign-in, persists cookies in our profile.
+    # Fast path: --login <platform> — end-to-end flow:
+    # 1. opens visible Chromium for one-time sign-in
+    # 2. verifies login by fetching an existing subscription
+    # 3. writes RSS_PLAYWRIGHT_PLATFORMS=<...,platform> to .env
     if "--login" in sys.argv:
         idx = sys.argv.index("--login")
         platform = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
@@ -214,8 +216,9 @@ def main():
             print("Usage: python scripts/lets_go_rss.py --login <twitter|xiaohongshu|bilibili>")
             sys.exit(2)
         sys.path.insert(0, str(SCRIPTS_DIR))
-        from playwright_adapter import login_platform
-        sys.exit(login_platform(platform))
+        from playwright_adapter import run_login_flow
+        db_path = str(ASSETS_DIR / "rss_database.db")
+        sys.exit(run_login_flow(platform, skill_dir=SKILL_DIR, db_path=db_path))
 
     # Skip setup for --skip-setup (cron jobs)
     skip_setup = '--skip-setup' in sys.argv

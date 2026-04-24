@@ -101,8 +101,13 @@ def _worker_init():
             headless=True,
             viewport={"width": 1280, "height": 800},
             user_agent=DEFAULT_UA,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+            ignore_default_args=["--enable-automation"],
         )
+        ctx.add_init_script(_STEALTH_INIT_JS)
         _thread_local.pw = pw
         _thread_local.ctx = ctx
         _thread_local.init_error = None
@@ -287,23 +292,12 @@ def fetch_bilibili_user(uid: str, timeout: float = 25.0) -> List[Dict[str, Any]]
 def fetch_xhs_user(user_id: str, timeout: float = 25.0) -> List[Dict[str, Any]]:
     """Fetch an XHS user's recent notes via our managed profile.
 
-    If the profile is not logged in, XHS redirects to captcha/login — we
-    raise a clear error that maps to `auth` error_kind.
+    XHS renders the profile's notes list server-side into DOM (no user_posted
+    XHR any more as of 2025+). We parse `section.note-item` cards directly.
+    If the profile is not logged in, XHS redirects to captcha/login — raised
+    so the error_kind is tagged `auth`.
     """
-    captured: Dict[str, Any] = {"notes": None}
-
-    def _on_response(response):
-        try:
-            if "user_posted" in response.url or "user/posted" in response.url:
-                data = response.json()
-                notes = (data.get("data") or {}).get("notes", [])
-                if notes and captured["notes"] is None:
-                    captured["notes"] = notes
-        except Exception:
-            pass
-
     def _job(page):
-        page.on("response", _on_response)
         page.goto(
             f"https://www.xiaohongshu.com/user/profile/{user_id}",
             wait_until="domcontentloaded",
@@ -314,25 +308,47 @@ def fetch_xhs_user(user_id: str, timeout: float = 25.0) -> List[Dict[str, Any]]:
                 "XHS profile not logged in — run: "
                 "python scripts/lets_go_rss.py --login xiaohongshu"
             )
-        # Wait for XHR
-        deadline = time.time() + 10.0
-        while time.time() < deadline and captured["notes"] is None:
-            page.wait_for_timeout(500)
-        return captured["notes"]
+        # Let the note grid render (lazy + image loading doesn't matter to us)
+        try:
+            page.wait_for_selector("section.note-item", timeout=8000)
+        except Exception:
+            pass
+        # Extract note cards in a single evaluate (robust to DOM churn)
+        return page.evaluate("""() => {
+            const out = [];
+            const cards = document.querySelectorAll('section.note-item');
+            for (const c of cards) {
+                const a = c.querySelector("a[href*='/explore/']") ||
+                          c.querySelector("a[href*='/user/profile/']");
+                if (!a) continue;
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/\\/explore\\/([0-9a-f]+)|\\/profile\\/[^/]+\\/([0-9a-f]+)/i);
+                const noteId = m ? (m[1] || m[2]) : '';
+                if (!noteId) continue;
+                // Title: first non-empty innerText line that isn't the pinned badge
+                const lines = (c.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                const title = lines.find(l => l !== '置顶') || '';
+                out.push({ note_id: noteId, title });
+                if (out.length >= 20) break;
+            }
+            return out;
+        }""")
 
-    notes = _run_on_worker(_job, page_timeout=timeout)
-    if not notes:
-        raise RuntimeError("XHS note XHR capture failed (no notes returned)")
+    raw = _run_on_worker(_job, page_timeout=timeout)
+    if not raw:
+        raise RuntimeError("XHS DOM extraction returned no notes")
 
     items: List[Dict[str, Any]] = []
-    for n in notes[:20]:
-        note_id = n.get("note_id") or n.get("id") or ""
-        link = f"https://www.xiaohongshu.com/explore/{note_id}" if note_id else ""
-        title = n.get("display_title") or n.get("title") or ""
+    for n in raw:
+        note_id = n.get("note_id", "")
+        title = (n.get("title") or "").strip()
+        if not note_id:
+            continue
+        link = f"https://www.xiaohongshu.com/explore/{note_id}"
         items.append({
-            "item_id": _item_id("xiaohongshu", note_id or link or title),
+            "item_id": _item_id("xiaohongshu", note_id),
             "title": title,
-            "description": _clip(n.get("desc") or n.get("description")),
+            "description": "",
             "link": link,
             "pub_date": "",
             "metadata": {"source": "playwright:xiaohongshu"},
@@ -453,9 +469,191 @@ LOGIN_URLS = {
 }
 
 
-def login_platform(platform: str) -> int:
-    """Open a visible Chromium window pointed at the platform's login page.
+_STEALTH_INIT_JS = """
+// Hide classic automation signals that sites like x.com check on keystroke.
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+// Fill in plugins / languages to match a real browser session
+Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
+// Provide a believable chrome.runtime object
+window.chrome = window.chrome || { runtime: {}, app: {}, csi: function(){}, loadTimes: function(){} };
+// Permissions.query('notifications') must behave like a real browser
+const origQuery = navigator.permissions && navigator.permissions.query;
+if (origQuery) {
+  navigator.permissions.query = (params) =>
+    params && params.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : origQuery.call(navigator.permissions, params);
+}
+"""
+
+
+def _open_login_window(platform: str) -> None:
+    """Open a visible real Chrome pointed at the platform's login page.
     Blocks until the user closes the window. Cookies persist in our profile.
+
+    Uses `channel='chrome'` (the user's real Google Chrome binary) when
+    available, falling back to bundled Chromium. Real Chrome is dramatically
+    harder for sites like x.com to fingerprint as automation. We also strip
+    the `--enable-automation` launch flag and inject a stealth init script
+    (navigator.webdriver / plugins / languages / chrome.runtime).
+    """
+    _teardown()  # release any headless context first
+
+    from playwright.sync_api import sync_playwright
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _launch(pw, channel: Optional[str]):
+        kwargs = dict(
+            user_data_dir=str(PROFILE_DIR),
+            headless=False,
+            viewport={"width": 1280, "height": 800},
+            user_agent=DEFAULT_UA,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+            ignore_default_args=["--enable-automation"],
+        )
+        if channel:
+            kwargs["channel"] = channel
+        return pw.chromium.launch_persistent_context(**kwargs)
+
+    with sync_playwright() as pw:
+        ctx = None
+        last_err = None
+        # Prefer real Chrome, then stable Chrome channels, then bundled Chromium
+        for channel in ("chrome", "chrome-beta", "chrome-dev", None):
+            try:
+                ctx = _launch(pw, channel)
+                if channel:
+                    print(f"[login] launched real Chrome (channel={channel})")
+                else:
+                    print("[login] launched bundled Chromium (no real Chrome found)")
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if ctx is None:
+            raise RuntimeError(f"could not launch any Chrome channel: {last_err}")
+
+        ctx.add_init_script(_STEALTH_INIT_JS)
+        page = ctx.new_page()
+        page.goto(LOGIN_URLS[platform])
+        print(f"[login] opened {LOGIN_URLS[platform]}")
+        print("[login] sign in, then close the Chromium window to continue.")
+        try:
+            page.wait_for_event("close", timeout=0)
+        except Exception:
+            pass
+        ctx.close()
+
+
+def _pick_test_user(platform: str, db_path: str) -> Optional[str]:
+    """Return a user_id/username from an existing DB subscription of this
+    platform, for post-login verification. Returns None if no sub exists."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT url FROM subscriptions WHERE platform=? LIMIT 1",
+            (platform,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    url = row[0]
+    # Reuse the scraper's own extract_user_id logic
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from scrapers import ScraperFactory
+        scraper = ScraperFactory.get_scraper(platform)
+        if scraper is None:
+            return None
+        return scraper.extract_user_id(url)
+    except Exception:
+        return None
+
+
+def _verify_platform(platform: str, db_path: str) -> Dict[str, Any]:
+    """Run a test fetch against an existing subscription of this platform.
+
+    Returns {"ok": bool, "detail": str, "items": int}."""
+    user_id = _pick_test_user(platform, db_path)
+    if not user_id:
+        return {"ok": False, "detail": "no existing subscription to test against", "items": 0}
+
+    fetchers = {
+        "bilibili": fetch_bilibili_user,
+        "xiaohongshu": fetch_xhs_user,
+        "twitter": fetch_twitter_user,
+    }
+    fn = fetchers.get(platform)
+    if not fn:
+        return {"ok": False, "detail": f"no fetcher for {platform}", "items": 0}
+
+    try:
+        items = fn(user_id)
+    except Exception as e:
+        return {"ok": False, "detail": str(e)[:150], "items": 0}
+    return {"ok": bool(items), "detail": f"fetched user={user_id}", "items": len(items)}
+
+
+def _enable_platform_in_env(platform: str, env_path: Path) -> bool:
+    """Idempotently add `platform` to RSS_PLAYWRIGHT_PLATFORMS in .env.
+
+    Creates .env if missing. Returns True if the file was written."""
+    lines: List[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    # Find existing active line (not a comment)
+    key = "RSS_PLAYWRIGHT_PLATFORMS"
+    found_idx = -1
+    current_list: List[str] = []
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith(f"{key}="):
+            found_idx = i
+            raw = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            current_list = [p.strip() for p in raw.split(",") if p.strip()]
+            break
+
+    if platform in current_list:
+        return False  # already enabled; no write needed
+
+    # If no existing value, seed with the cron default so we don't silently
+    # demote bilibili (which run_update_cron.sh enables by default).
+    if not current_list:
+        current_list = ["bilibili"]
+
+    new_list = current_list + [p for p in [platform] if p not in current_list]
+    new_line = f"{key}={','.join(new_list)}"
+    if found_idx >= 0:
+        lines[found_idx] = new_line
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"# Added by --login {platform} verification flow")
+        lines.append(new_line)
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def run_login_flow(platform: str, *, skill_dir: Path, db_path: str,
+                   verify: bool = True, enable: bool = True) -> int:
+    """End-to-end: open browser → user logs in → verify → persist in .env.
+
+    This is the one-stop "set up platform X" entry point for an agent to
+    orchestrate. Returns 0 on success, nonzero on failure.
     """
     platform = platform.lower()
     if platform not in LOGIN_URLS:
@@ -463,27 +661,42 @@ def login_platform(platform: str) -> int:
               file=sys.stderr)
         return 2
 
-    # Tear down any existing headless context; we want a fresh visible one.
-    _teardown()
+    print(f"\n[{platform}] step 1/3: opening Chromium for you to sign in …")
+    _open_login_window(platform)
 
-    from playwright.sync_api import sync_playwright
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            viewport={"width": 1280, "height": 800},
-            user_agent=DEFAULT_UA,
-        )
-        page = ctx.new_page()
-        page.goto(LOGIN_URLS[platform])
-        print(f"[login] opened {LOGIN_URLS[platform]}")
-        print("[login] sign in, then close the browser window to finish.")
-        try:
-            # Wait for browser window to close
-            page.wait_for_event("close", timeout=0)
-        except Exception:
-            pass
-        ctx.close()
+    if not verify:
+        print(f"[{platform}] step 2/3: skipped (verify=False)")
+    else:
+        print(f"[{platform}] step 2/3: verifying login by fetching a real sub …")
+        result = _verify_platform(platform, db_path)
+        if not result["ok"]:
+            print(f"[{platform}] ❌ verification failed: {result['detail']}")
+            print(f"[{platform}] cookies may not have been saved, or platform")
+            print(f"[{platform}] still flags us as non-logged-in. Try again.")
+            return 3
+        print(f"[{platform}] ✅ verified: got {result['items']} items ({result['detail']})")
+
+    if not enable:
+        print(f"[{platform}] step 3/3: skipped (enable=False)")
+        return 0
+
+    env_path = skill_dir / ".env"
+    changed = _enable_platform_in_env(platform, env_path)
+    if changed:
+        print(f"[{platform}] ✅ step 3/3: enabled in {env_path}")
+    else:
+        print(f"[{platform}] step 3/3: already enabled in {env_path} (no change)")
+    return 0
+
+
+def login_platform(platform: str) -> int:
+    """Back-compat wrapper — opens the browser but does NOT verify/enable.
+    Prefer `run_login_flow` for the end-to-end path."""
+    platform = platform.lower()
+    if platform not in LOGIN_URLS:
+        print(f"Unknown platform: {platform!r}. Supported: {list(LOGIN_URLS)}",
+              file=sys.stderr)
+        return 2
+    _open_login_window(platform)
     print(f"[login] done — cookies saved to {PROFILE_DIR}")
     return 0
